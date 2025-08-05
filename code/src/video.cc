@@ -8,7 +8,7 @@
 // 构造函数，初始化参数
 Video::Video(int width, int height, int model_width, int model_height)
     : width_(width), height_(height), model_width_(model_width), model_height_(model_height),
-      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false) {
+      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), ai_enable_(false) {
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
 }
 
@@ -125,22 +125,24 @@ void Video::mainLoop() {
             // letterbox处理，适配模型输入
             cv::Mat letterboxImage = letterbox(frame_);
             memcpy(rknn_app_ctx_.input_mems[0]->virt_addr, letterboxImage.data, model_width_ * model_height_ * 3);
-            // 推理
-            inference_yolov5_model(&rknn_app_ctx_, &od_results_);
-            // 处理推理结果，画框和标签
-            for(int i = 0; i < od_results_.count; i++) {
-                if(od_results_.count >= 1) {
-                    object_detect_result *det_result = &(od_results_.results[i]);
-                    sX = (int)(det_result->box.left);
-                    sY = (int)(det_result->box.top);
-                    eX = (int)(det_result->box.right);
-                    eY = (int)(det_result->box.bottom);
-                    mapCoordinates(&sX, &sY);
-                    mapCoordinates(&eX, &eY);
-                    printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
-                    cv::rectangle(frame_, cv::Point(sX, sY), cv::Point(eX, eY), cv::Scalar(0,255,0), 3);
-                    sprintf(text_, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-                    cv::putText(frame_, text_, cv::Point(sX, sY - 8), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0,255,0), 2);
+            if (ai_enable_) {
+                // 推理
+                inference_yolov5_model(&rknn_app_ctx_, &od_results_);
+                // 处理推理结果，画框和标签
+                for(int i = 0; i < od_results_.count; i++) {
+                    if(od_results_.count >= 1) {
+                        object_detect_result *det_result = &(od_results_.results[i]);
+                        sX = (int)(det_result->box.left);
+                        sY = (int)(det_result->box.top);
+                        eX = (int)(det_result->box.right);
+                        eY = (int)(det_result->box.bottom);
+                        mapCoordinates(&sX, &sY);
+                        mapCoordinates(&eX, &eY);
+                        printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
+                        cv::rectangle(frame_, cv::Point(sX, sY), cv::Point(eX, eY), cv::Scalar(0,255,0), 3);
+                        sprintf(text_, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
+                        cv::putText(frame_, text_, cv::Point(sX, sY - 8), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0,255,0), 2);
+                    }
                 }
             }
             // 编码并推流
@@ -185,4 +187,11 @@ void Video::mapCoordinates(int *x, int *y) {
     int my = *y - topPadding_;
     *x = (int)((float)mx / scale_);
     *y = (int)((float)my / scale_);
+}
+
+void Video::startAI() {
+    ai_enable_ = true;
+}
+void Video::stopAI() {
+    ai_enable_ = false;
 }

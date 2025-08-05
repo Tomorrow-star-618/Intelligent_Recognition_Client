@@ -24,6 +24,10 @@ public:
     bool start();
     // 停止主循环线程并清理资源
     void stop();
+    // 开启AI识别
+    void startAI();
+    // 关闭AI识别
+    void stopAI();
 
 private:
     // 线程入口函数
@@ -66,6 +70,7 @@ private:
     // 线程相关
     pthread_t thread_;
     bool running_;
+    bool ai_enable_; // AI识别开关标志
 };
 
 #endif // VIDEO_H
