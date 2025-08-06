@@ -5,10 +5,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+
 // 构造函数，初始化参数
 Video::Video(int width, int height, int model_width, int model_height)
     : width_(width), height_(height), model_width_(model_width), model_height_(model_height),
-      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), ai_enable_(false) {
+      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), ai_enable_(false), area_enable_(false) {
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
 }
 
@@ -128,7 +129,7 @@ void Video::mainLoop() {
             if (ai_enable_) {
                 // 推理
                 inference_yolov5_model(&rknn_app_ctx_, &od_results_);
-                // 处理推理结果，画框和标签
+                // 遍历所有检测到的目标
                 for(int i = 0; i < od_results_.count; i++) {
                     if(od_results_.count >= 1) {
                         object_detect_result *det_result = &(od_results_.results[i]);
@@ -138,10 +139,29 @@ void Video::mainLoop() {
                         eY = (int)(det_result->box.bottom);
                         mapCoordinates(&sX, &sY);
                         mapCoordinates(&eX, &eY);
-                        printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
-                        cv::rectangle(frame_, cv::Point(sX, sY), cv::Point(eX, eY), cv::Scalar(0,255,0), 3);
-                        sprintf(text_, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-                        cv::putText(frame_, text_, cv::Point(sX, sY - 8), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0,255,0), 2);
+                        bool drawBox = true;
+                        if (area_enable_) {
+                            // 区域识别开启时，判断检测框是否整体在归一化区域内
+                            float rx = video_rectInfo.x;
+                            float ry = video_rectInfo.y;
+                            float rw = video_rectInfo.w;
+                            float rh = video_rectInfo.h;
+                            // 检测框左上、右下归一化坐标
+                            float left_norm = (float)sX / (float)width_;
+                            float top_norm = (float)sY / (float)height_;
+                            float right_norm = (float)eX / (float)width_;
+                            float bottom_norm = (float)eY / (float)height_;
+                            // 判断检测框是否完全在区域框内
+                            if (!(left_norm >= rx && right_norm <= rx+rw && top_norm >= ry && bottom_norm <= ry+rh)) {
+                                drawBox = false; // 只要有一边超出区域则过滤
+                            }
+                        }
+                        if (drawBox) {
+                            printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
+                            cv::rectangle(frame_, cv::Point(sX, sY), cv::Point(eX, eY), cv::Scalar(0,255,0), 3);
+                            sprintf(text_, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
+                            cv::putText(frame_, text_, cv::Point(sX, sY - 8), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0,255,0), 2);
+                        }
                     }
                 }
             }
@@ -189,9 +209,24 @@ void Video::mapCoordinates(int *x, int *y) {
     *y = (int)((float)my / scale_);
 }
 
+
+void Video::getRectInfo(const RectInfo& info) {
+    video_rectInfo.x = info.x;
+    video_rectInfo.y = info.y;
+    video_rectInfo.w = info.w;
+    video_rectInfo.h = info.h;
+}
+
+
 void Video::startAI() {
     ai_enable_ = true;
 }
 void Video::stopAI() {
     ai_enable_ = false;
+}
+void Video::startAreaDetect() {
+    area_enable_ = true;
+}
+void Video::stopAreaDetect() {
+    area_enable_ = false;
 }

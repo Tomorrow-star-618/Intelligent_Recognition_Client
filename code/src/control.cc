@@ -41,6 +41,16 @@ void Control::parseAndDispatch(const std::string& cmd) {
                 } else {
                     printf("未支持的operationValue: %d\n", operationValue);
                 }
+            } else if (operationId == 7) {
+                if (operationValue == 1) {
+                    m_video->startAreaDetect();
+                    printf("区域识别已开启\n");
+                } else if (operationValue == 0) {
+                    m_video->stopAreaDetect();
+                    printf("区域识别已关闭\n");
+                } else {
+                    printf("未支持的operationValue: %d\n", operationValue);
+                }
             } else {
                 printf("未支持的operationId: %d\n", operationId);
             }
@@ -51,3 +61,21 @@ void Control::parseAndDispatch(const std::string& cmd) {
         printf("命令格式错误: %s\n", cmd.c_str());
     }
 }
+
+// 解析矩形框数据，格式: RECT:x:y:w:h
+void Control::parseRectInfo(const std::string& rectCmd) {
+    float fx = 0, fy = 0, fw = 0, fh = 0;
+    if (sscanf(rectCmd.c_str(), "RECT:%f:%f:%f:%f", &fx, &fy, &fw, &fh) == 4) {
+        printf("收到归一化矩形框数据: x=%.3f, y=%.3f, w=%.3f, h=%.3f\n", fx, fy, fw, fh);
+        m_rectInfo.x = fx;
+        m_rectInfo.y = fy;
+        m_rectInfo.w = fw;
+        m_rectInfo.h = fh;
+        // 更新Video中的矩形框信息
+        m_video->getRectInfo(m_rectInfo);
+    } else {
+        printf("RECT命令格式错误: %s\n", rectCmd.c_str());
+    }
+}
+
+

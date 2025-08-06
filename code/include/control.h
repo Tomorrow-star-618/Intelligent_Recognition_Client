@@ -3,10 +3,11 @@
 #define CONTROL_H
 
 #include <string>
+#include "common.h"
 #include "servo.h"
 #include "video.h"
 
-// Control类：负责解析命令字符串并分发到对应的处理函数
+// Control类：负责解析命令字符串并分发
 class Control {
 public:
     // 构造时传入Servo和Video指针
@@ -14,10 +15,14 @@ public:
 
     // 解析命令字符串并分发
     void parseAndDispatch(const std::string& cmd);
+    // 解析区域识别命令
+    void parseRectInfo(const std::string& rectCmd);
+
 
 private:
     Servo* m_servo;
     Video* m_video;
+    RectInfo m_rectInfo; // 保存最新的矩形框数据
 };
 
 #endif // CONTROL_H

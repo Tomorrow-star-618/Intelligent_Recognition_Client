@@ -9,6 +9,7 @@
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
 #include "yolov5.h"
+#include "common.h"
 
 // Video类：封装视频采集、推理、编码、推流等功能，支持独立线程运行
 class Video {
@@ -28,6 +29,12 @@ public:
     void startAI();
     // 关闭AI识别
     void stopAI();
+    // 开启区域识别
+    void startAreaDetect();
+    // 关闭区域识别
+    void stopAreaDetect();
+    // 获取当前矩形框信息
+    void getRectInfo(const RectInfo& info);
 
 private:
     // 线程入口函数
@@ -70,7 +77,11 @@ private:
     // 线程相关
     pthread_t thread_;
     bool running_;
-    bool ai_enable_; // AI识别开关标志
+    bool ai_enable_;      // AI识别开关标志
+    bool area_enable_;    // 区域识别开关标志
+
+    // 矩形框信息
+    RectInfo video_rectInfo;
 };
 
 #endif // VIDEO_H

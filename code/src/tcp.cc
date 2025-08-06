@@ -46,6 +46,11 @@ bool TcpClient::init() {
 
 // 启动TCP线程，线程内循环心跳和接收
 bool TcpClient::start() {
+    // 自动重连，直到连接成功
+    while (!init()) {
+        printf("TCP连接失败，5秒后重试...\n");
+        sleep(5);
+    }
     running_ = true;
     return pthread_create(&thread_, NULL, threadFunc, this) == 0;
 }
@@ -79,43 +84,25 @@ void* TcpClient::threadFunc(void* arg) {
 // 线程主循环：定时发送心跳，接收服务器数据
 void TcpClient::run() {
     char buf[128];
-    extern Control g_control; // 假设全局或外部有一个Control实例
-    unsigned int check_interval_us = 10000000; // 10秒
-    unsigned int elapsed_us = 0;
-    while (running_) {
-        if (!connected_) {
-            printf("TCP未连接，尝试重连...\n");
-            if (init()) {
-                printf("TCP重连成功！\n");
-            } else {
-                printf("TCP重连失败，10秒后重试\n");
-                usleep(check_interval_us);
-                continue;
-            }
-        }
-        // 非阻塞接收服务器响应
+    extern Control g_control;
+    while (running_ && connected_) {
         ssize_t n = recv(sockfd_, buf, sizeof(buf)-1, MSG_DONTWAIT);
         if (n > 0) {
             buf[n] = '\0';
             printf("TCP recv: %s\n", buf);
-            g_control.parseAndDispatch(std::string(buf));
+            // 判断前缀，选择不同解析函数
+            if (strncmp(buf, "RECT:", 5) == 0) {
+                g_control.parseRectInfo(std::string(buf));
+            } else {
+                g_control.parseAndDispatch(std::string(buf));
+            }
         } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-            // 连接断开
-            printf("TCP连接断开，准备重连...\n");
+            printf("TCP连接断开，线程退出，等待主流程重连...\n");
             connected_ = false;
             close(sockfd_);
             sockfd_ = -1;
-            usleep(1000000); // 1秒后再试
-            continue;
+            break;
         }
         usleep(10000);
-        elapsed_us += 10000;
-        if (elapsed_us >= check_interval_us) {
-            elapsed_us = 0;
-            if (!connected_) {
-                printf("定时检测到TCP未连接，尝试重连...\n");
-                init();
-            }
-        }
     }
 }

@@ -49,13 +49,9 @@ int main(int argc, char *argv[])
         printf("TCP客户端初始化失败！\n");
     }
 
-	// 启动TCP线程
-    if (tcp.isConnected()) {
-        tcp.start();
-        printf("TCP线程已自动启动\n");
-    } else {
-        printf("TCP未连接，无法自动启动线程！\n");
-    }
+	// 启动TCP线程（由start内部自动重连并启动）
+    tcp.start();
+    printf("TCP线程已自动启动\n");
 
     // 初始化并启动视频处理模块
     if (g_video.init()) {
@@ -89,6 +85,8 @@ int main(int argc, char *argv[])
     printf("正在停止TCP线程...\n");
     tcp.stop();
     printf("TCP线程已停止\n");
+
+	g_servo
 
     printf("程序已安全退出\n");
     return 0;

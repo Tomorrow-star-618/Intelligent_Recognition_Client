@@ -2,6 +2,7 @@
 #include "servo.h"
 #include "pwm.h"
 #include <stdio.h>
+#include <unistd.h>
 
 Servo::Servo() {}
 Servo::~Servo() {}
@@ -71,6 +72,17 @@ int Servo::control(int servo_type, int direction, int value) {
 
     // 使能PWM
     ret = pwm_enable(pwm_path, 1);
+    if (ret != 0) {
+        printf("PWM使能失败\n");
+        pwm_release(pwm_path);
+        return -1;
+    }
+
+    // 等待一段时间让舵机转动
+    usleep(500000); // 等待500ms
+
+    // 取消使能PWM
+    ret = pwm_enable(pwm_path, 0);
     if (ret != 0) {
         printf("PWM使能失败\n");
         pwm_release(pwm_path);
