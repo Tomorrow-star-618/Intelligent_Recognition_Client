@@ -3,6 +3,7 @@
 #define CONTROL_H
 
 #include <string>
+#include <vector>
 #include "common.h"
 #include "servo.h"
 #include "video.h"
@@ -17,12 +18,15 @@ public:
     void parseAndDispatch(const std::string& cmd);
     // 解析区域识别命令
     void parseRectInfo(const std::string& rectCmd);
+    // 解析对象列表命令
+    void parseObjList(const std::string& listCmd);
 
 
 private:
     Servo* m_servo;
     Video* m_video;
     RectInfo m_rectInfo; // 保存最新的矩形框数据
+    std::vector<int> m_objList; // 选中对象ID列表
 };
 
 #endif // CONTROL_H

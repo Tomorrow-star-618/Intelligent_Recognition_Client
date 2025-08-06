@@ -51,6 +51,26 @@ void Control::parseAndDispatch(const std::string& cmd) {
                 } else {
                     printf("未支持的operationValue: %d\n", operationValue);
                 }
+            } else if (operationId == 8) {
+                if (operationValue == 1) {
+                    m_video->startObjectDetect();
+                    printf("对象识别已开启\n");
+                } else if (operationValue == 0) {
+                    m_video->stopObjectDetect();
+                    printf("对象识别已关闭\n");
+                } else {
+                    printf("未支持的operationValue: %d\n", operationValue);
+                }
+            } else if (operationId == 9) {
+                if (operationValue == 1) {
+                    m_video->startRTSP();
+                    printf("RTSP推流已开启\n");
+                } else if (operationValue == 0) {
+                    m_video->stopRTSP();
+                    printf("RTSP推流已关闭\n");
+                } else {
+                    printf("未支持的operationValue: %d\n", operationValue);
+                }
             } else {
                 printf("未支持的operationId: %d\n", operationId);
             }
@@ -77,5 +97,40 @@ void Control::parseRectInfo(const std::string& rectCmd) {
         printf("RECT命令格式错误: %s\n", rectCmd.c_str());
     }
 }
+
+void Control::parseObjList(const std::string& listCmd) {
+    m_objList.clear();
+    // 解析LIST:0,1,2,3格式
+    size_t pos = listCmd.find(":");
+    if (pos == std::string::npos || pos + 1 >= listCmd.size()) {
+        printf("LIST命令格式错误: %s\n", listCmd.c_str());
+        return;
+    }
+    std::string nums = listCmd.substr(pos + 1);
+    size_t start = 0, end = 0;
+    while ((end = nums.find(',', start)) != std::string::npos) {
+        int id = atoi(nums.substr(start, end - start).c_str());
+        m_objList.push_back(id);
+        start = end + 1;
+    }
+    // 最后一个数字
+    if (start < nums.size()) {
+        int id = atoi(nums.substr(start).c_str());
+        m_objList.push_back(id);
+    }
+    
+    // 更新Video中的对象列表
+    m_video->getObjectList(m_objList);
+
+    // 打印解析结果
+    printf("选中对象ID及类别: ");
+    for (size_t i = 0; i < m_objList.size(); ++i) {
+        int id = m_objList[i];
+        const char* name = (id >= 0 && id < 80) ? COCO_CLASS_NAMES[id] : "未知";
+        printf("%d:%s ", id, name);
+    }
+    printf("\n");
+}
+
 
 

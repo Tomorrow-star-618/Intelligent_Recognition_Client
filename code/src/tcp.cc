@@ -93,6 +93,8 @@ void TcpClient::run() {
             // 判断前缀，选择不同解析函数
             if (strncmp(buf, "RECT:", 5) == 0) {
                 g_control.parseRectInfo(std::string(buf));
+            } else if (strncmp(buf, "LIST:", 5) == 0) {
+                g_control.parseObjList(std::string(buf));
             } else {
                 g_control.parseAndDispatch(std::string(buf));
             }

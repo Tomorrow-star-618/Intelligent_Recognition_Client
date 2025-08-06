@@ -9,7 +9,7 @@
 // 构造函数，初始化参数
 Video::Video(int width, int height, int model_width, int model_height)
     : width_(width), height_(height), model_width_(model_width), model_height_(model_height),
-      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), ai_enable_(false), area_enable_(false) {
+      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), ai_enable_(false), area_enable_(false), obj_enable_(false) {
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
 }
 
@@ -103,8 +103,9 @@ void Video::stop() {
 
 // 线程入口，调用mainLoop
 void* Video::threadFunc(void* arg) {
-    Video* self = static_cast<Video*>(arg);
-    self->mainLoop();
+    
+    Video* self = static_cast<Video*>(arg);   
+    self->mainLoop(); 
     return nullptr;
 }
 
@@ -140,6 +141,17 @@ void Video::mainLoop() {
                         mapCoordinates(&sX, &sY);
                         mapCoordinates(&eX, &eY);
                         bool drawBox = true;
+                        // 对象识别容器过滤逻辑
+                        if (obj_enable_ && !video_objList.empty()) {
+                            bool found = false;
+                            for (size_t j = 0; j < video_objList.size(); ++j) {
+                                if (det_result->cls_id == video_objList[j]) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) drawBox = false; // 不在对象列表则过滤
+                        }
                         if (area_enable_) {
                             // 区域识别开启时，判断检测框是否整体在归一化区域内
                             float rx = video_rectInfo.x;
@@ -211,12 +223,20 @@ void Video::mapCoordinates(int *x, int *y) {
 
 
 void Video::getRectInfo(const RectInfo& info) {
+    //拷贝一份数据到 video_rectInfo
     video_rectInfo.x = info.x;
     video_rectInfo.y = info.y;
     video_rectInfo.w = info.w;
     video_rectInfo.h = info.h;
 }
 
+void Video::getObjectList(const std::vector<int>& objList) {
+    // 处理对象列表逻辑，拷贝数据到 video_objList
+    video_objList.clear();
+    for (const auto& obj : objList) {
+        video_objList.push_back(obj);
+    }
+}
 
 void Video::startAI() {
     ai_enable_ = true;
@@ -229,4 +249,16 @@ void Video::startAreaDetect() {
 }
 void Video::stopAreaDetect() {
     area_enable_ = false;
+}
+void Video::startObjectDetect() {
+    obj_enable_ = true;
+}
+void Video::stopObjectDetect() {
+    obj_enable_ = false;
+}
+void Video::startRTSP() {
+    rtsp_enable_ = true;   
+}
+void Video::stopRTSP() {
+    rtsp_enable_ = false;
 }

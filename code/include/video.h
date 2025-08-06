@@ -9,6 +9,7 @@
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
 #include "yolov5.h"
+#include <vector>
 #include "common.h"
 
 // Video类：封装视频采集、推理、编码、推流等功能，支持独立线程运行
@@ -33,8 +34,19 @@ public:
     void startAreaDetect();
     // 关闭区域识别
     void stopAreaDetect();
+    // 开启对象识别
+    void startObjectDetect();
+    // 关闭对象识别
+    void stopObjectDetect();
+    // 开启RTSP推流
+    void startRTSP();
+    // 关闭RTSP推流
+    void stopRTSP();
     // 获取当前矩形框信息
     void getRectInfo(const RectInfo& info);
+    // 获取对象列表
+    void getObjectList(const std::vector<int>& objList);
+         
 
 private:
     // 线程入口函数
@@ -79,9 +91,13 @@ private:
     bool running_;
     bool ai_enable_;      // AI识别开关标志
     bool area_enable_;    // 区域识别开关标志
+    bool obj_enable_;     // 对象识别开关标志
+    bool rtsp_enable_;    // RTSP推流开关标志
 
     // 矩形框信息
     RectInfo video_rectInfo;
+    // 对象列表
+    std::vector<int> video_objList;
 };
 
 #endif // VIDEO_H

@@ -86,8 +86,6 @@ int main(int argc, char *argv[])
     tcp.stop();
     printf("TCP线程已停止\n");
 
-	g_servo
-
     printf("程序已安全退出\n");
     return 0;
 }
