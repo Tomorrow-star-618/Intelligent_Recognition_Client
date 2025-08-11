@@ -36,8 +36,21 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 # 获取源文件
-set(SRC_DIR "${EXAMPLE_DIR}/src")
-file(GLOB SRC_FILES "${SRC_DIR}/*.cc")
+file(GLOB SRC_CONTROL "${EXAMPLE_DIR}/modules/control/*.cc")
+file(GLOB SRC_SERVO "${EXAMPLE_DIR}/modules/servo/*.cc")
+file(GLOB SRC_TCP "${EXAMPLE_DIR}/modules/tcp/*.cc")
+file(GLOB SRC_VIDEO "${EXAMPLE_DIR}/modules/video/*.cc")
+file(GLOB SRC_YOLO "${EXAMPLE_DIR}/modules/yolo/*.cc")
+file(GLOB SRC_MAIN "${EXAMPLE_DIR}/src/*.cc")
+
+set(SRC_FILES
+    ${SRC_CONTROL}
+    ${SRC_SERVO}
+    ${SRC_TCP}
+    ${SRC_VIDEO}
+    ${SRC_YOLO}
+    ${SRC_MAIN}
+)
 add_executable(${PROJECT_NAME} ${SRC_FILES})
 
 # 设置编译选项
@@ -69,6 +82,11 @@ target_link_libraries(${PROJECT_NAME}
 target_include_directories(${PROJECT_NAME} PRIVATE                        
                             ${OpenCV_INCLUDE_DIRS}
                             ${EXAMPLE_DIR}/include
+                            ${EXAMPLE_DIR}/modules/control 
+                            ${EXAMPLE_DIR}/modules/servo
+                            ${EXAMPLE_DIR}/modules/tcp
+                            ${EXAMPLE_DIR}/modules/video
+                            ${EXAMPLE_DIR}/modules/yolo
                             ${CMAKE_CURRENT_SOURCE_DIR}
                             ${CMAKE_CURRENT_SOURCE_DIR}/utils
                             ${CMAKE_CURRENT_SOURCE_DIR}/common 
