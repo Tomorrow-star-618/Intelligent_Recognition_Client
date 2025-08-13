@@ -9,7 +9,7 @@
 
 // 构造函数，初始化成员变量
 TcpClient::TcpClient(const std::string& ip, int port)
-    : ip_(ip), port_(port), sockfd_(-1), running_(false), connected_(false) {}
+    : ip_(ip), port_(port), sockfd_(-1), running_(false), connected_(false), control_(nullptr) {}
 
 // 析构函数，自动停止线程和关闭socket
 TcpClient::~TcpClient() {
@@ -74,6 +74,31 @@ bool TcpClient::isConnected() const {
     return connected_;
 }
 
+// 设置Control对象指针
+void TcpClient::setControl(Control* control) {
+    control_ = control;
+}
+
+// 发送数据到服务器
+bool TcpClient::sendData(const std::string& data) {
+    if (!connected_ || sockfd_ < 0) {
+        printf("TCP未连接，无法发送数据: %s\n", data.c_str());
+        return false;
+    }
+    
+    ssize_t sent = send(sockfd_, data.c_str(), data.length(), 0);
+    if (sent < 0) {
+        perror("TCP发送数据失败");
+        return false;
+    } else if ((size_t)sent != data.length()) {
+        printf("TCP数据发送不完整: 期望%zu字节，实际发送%zd字节\n", data.length(), sent);
+        return false;
+    }
+    
+    printf("TCP发送数据成功: %s\n", data.c_str());
+    return true;
+}
+
 // 线程入口函数，调用run()
 void* TcpClient::threadFunc(void* arg) {
     TcpClient* self = static_cast<TcpClient*>(arg);
@@ -81,22 +106,26 @@ void* TcpClient::threadFunc(void* arg) {
     return nullptr;
 }
 
-// 线程主循环：定时发送心跳，接收服务器数据
+// 线程主循环：接收服务器数据
 void TcpClient::run() {
     char buf[128];
-    extern Control g_control;
     while (running_ && connected_) {
         ssize_t n = recv(sockfd_, buf, sizeof(buf)-1, MSG_DONTWAIT);
         if (n > 0) {
             buf[n] = '\0';
             printf("TCP recv: %s\n", buf);
-            // 判断前缀，选择不同解析函数
-            if (strncmp(buf, "RECT:", 5) == 0) {
-                g_control.parseRectInfo(std::string(buf));
-            } else if (strncmp(buf, "LIST:", 5) == 0) {
-                g_control.parseObjList(std::string(buf));
+            // 如果Control对象存在，则处理接收到的数据
+            if (control_) {
+                // 判断前缀，选择不同解析函数
+                if (strncmp(buf, "RECT:", 5) == 0) {
+                    control_->parseRectInfo(std::string(buf));
+                } else if (strncmp(buf, "LIST:", 5) == 0) {
+                    control_->parseObjList(std::string(buf));
+                } else {
+                    control_->parseAndDispatch(std::string(buf));
+                }
             } else {
-                g_control.parseAndDispatch(std::string(buf));
+                printf("Warning: Control对象未设置，无法处理接收到的数据\n");
             }
         } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
             printf("TCP连接断开，线程退出，等待主流程重连...\n");

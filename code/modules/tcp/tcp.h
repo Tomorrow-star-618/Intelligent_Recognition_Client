@@ -5,6 +5,9 @@
 #include <string>
 #include <pthread.h>
 
+// 前向声明
+class Control;
+
 // TcpClient类：封装TCP客户端功能，支持独立线程心跳和接收
 class TcpClient {
 public:
@@ -20,6 +23,10 @@ public:
     void stop();
     // 查询当前连接状态
     bool isConnected() const;
+    // 设置Control对象指针
+    void setControl(Control* control);
+    // 发送数据到服务器
+    bool sendData(const std::string& data);
 
 private:
     // 线程入口函数
@@ -33,6 +40,7 @@ private:
     pthread_t thread_;    // 线程句柄
     bool running_;        // 线程运行标志
     bool connected_;      // 连接状态
+    Control* control_;    // Control对象指针
 };
 
 #endif // TCP_H

@@ -1,11 +1,13 @@
 // control.cc - 控制命令解析与分发模块实现
 #include "control.h"
+#include "tcp.h"
 #include <stdio.h>
 #include <sstream>
+#include <iomanip>
 
-// 构造函数，保存Servo和Video指针副本
-Control::Control(Servo* servoPtr, Video* videoPtr)
-    : m_servo(servoPtr ? new Servo(*servoPtr) : nullptr), m_video(videoPtr) {}
+// 构造函数，保存Servo、Video和TcpClient指针副本
+Control::Control(Servo* servoPtr, Video* videoPtr, TcpClient* tcpPtr)
+    : m_servo(servoPtr ? new Servo(*servoPtr) : nullptr), m_video(videoPtr), m_tcp(tcpPtr) {}
 
 // 解析命令字符串并分发
 void Control::parseAndDispatch(const std::string& cmd) {
@@ -98,6 +100,7 @@ void Control::parseRectInfo(const std::string& rectCmd) {
     }
 }
 
+// 解析对象列表数据
 void Control::parseObjList(const std::string& listCmd) {
     m_objList.clear();
     // 解析LIST:0,1,2,3格式
@@ -130,6 +133,16 @@ void Control::parseObjList(const std::string& listCmd) {
         printf("%d:%s ", id, name);
     }
     printf("\n");
+}
+
+// 处理汇总的检测结果（从Video模块接收）
+void Control::onDetectionSummary(const std::string& detectionSummary) {
+    // 直接发送汇总的检测结果
+    if (m_tcp && m_tcp->isConnected()) {
+        m_tcp->sendData(detectionSummary);
+    } else {
+        printf("TCP未连接，无法发送检测结果汇总: %s\n", detectionSummary.c_str());
+    }
 }
 
 

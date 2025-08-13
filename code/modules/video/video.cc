@@ -1,15 +1,19 @@
 // video.cc - 视频处理模块实现，采集、推理、编码、推流等功能，支持线程化
 #include "video.h"
+#include "control.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
+#include <sstream>
+#include <iomanip>
 
 
 // 构造函数，初始化参数
 Video::Video(int width, int height, int model_width, int model_height)
     : width_(width), height_(height), model_width_(model_width), model_height_(model_height),
-      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), ai_enable_(false), area_enable_(false), obj_enable_(false) {
+      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), ai_enable_(false), area_enable_(false), obj_enable_(false), control_(nullptr), last_send_time_(0), send_interval_(DEFAULT_SEND_INTERVAL) {
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
 }
 
@@ -130,6 +134,10 @@ void Video::mainLoop() {
             if (ai_enable_) {
                 // 推理
                 inference_yolov5_model(&rknn_app_ctx_, &od_results_);
+                
+                // 清空上一帧的检测结果
+                current_detections_.clear();
+                
                 // 遍历所有检测到的目标
                 for(int i = 0; i < od_results_.count; i++) {
                     if(od_results_.count >= 1) {
@@ -169,11 +177,37 @@ void Video::mainLoop() {
                             }
                         }
                         if (drawBox) {
+                            // 终端打印输出检测结果
                             printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
+                            // 绘制检测框和标签
                             cv::rectangle(frame_, cv::Point(sX, sY), cv::Point(eX, eY), cv::Scalar(0,255,0), 3);
                             sprintf(text_, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
                             cv::putText(frame_, text_, cv::Point(sX, sY - 8), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0,255,0), 2);
+                            
+                            // 收集检测结果信息
+                            DetectionInfo detection;
+                            detection.cls_id = det_result->cls_id;
+                            detection.cls_name = coco_cls_to_name(det_result->cls_id);
+                            detection.x = sX;
+                            detection.y = sY;
+                            detection.w = eX - sX;
+                            detection.h = eY - sY;
+                            detection.confidence = det_result->prop;
+                            current_detections_.push_back(detection);
                         }
+                    }
+                }            
+                // 检查是否需要发送检测结果（简化的时间控制）
+                if (!current_detections_.empty() && control_) {
+                    static time_t last_time = 0;  // 使用静态变量，更简单可靠
+                    time_t now = time(NULL);
+                    
+                    // 如果是第一次或者时间间隔足够
+                    if (last_time == 0 || (now - last_time) >= send_interval_) {
+                        std::string summary = buildDetectionSummary();
+                        control_->onDetectionSummary(summary);
+                        printf("发送检测结果汇总 (包含%zu个物体)\n", current_detections_.size());
+                        last_time = now;
                     }
                 }
             }
@@ -261,4 +295,38 @@ void Video::startRTSP() {
 }
 void Video::stopRTSP() {
     rtsp_enable_ = false;
+}
+
+void Video::setControl(Control* control) {
+    control_ = control;
+}
+
+// 设置检测结果发送间隔（秒）
+void Video::setSendInterval(int interval) {
+    if (interval > 0) {
+        send_interval_ = interval;
+        printf("检测结果发送间隔已设置为: %d秒\n", send_interval_);
+    } else {
+        printf("无效的发送间隔，必须大于0\n");
+    }
+}
+
+// 构建检测结果汇总字符串
+std::string Video::buildDetectionSummary() {
+    if (current_detections_.empty()) {
+        return "DETECTIONS:NONE";
+    }
+    
+    std::ostringstream oss;
+    oss << "DETECTIONS:" << current_detections_.size();
+    
+    for (size_t i = 0; i < current_detections_.size(); ++i) {
+        const DetectionInfo& detection = current_detections_[i];
+        oss << "|" << detection.cls_id << ":" << detection.cls_name 
+            << ":" << detection.x << ":" << detection.y 
+            << ":" << detection.w << ":" << detection.h 
+            << ":" << std::fixed << std::setprecision(3) << detection.confidence;
+    }
+    
+    return oss.str();
 }
