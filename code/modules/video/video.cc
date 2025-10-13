@@ -211,6 +211,32 @@ void Video::mainLoop() {
                     }
                 }
             }
+            
+            // 如果区域识别开启，在图像上绘制区域框
+            if (area_enable_) {
+                float rx = video_rectInfo.x;
+                float ry = video_rectInfo.y;
+                float rw = video_rectInfo.w;
+                float rh = video_rectInfo.h;
+                
+                // 将归一化坐标转换为像素坐标
+                int area_x = (int)(rx * width_);
+                int area_y = (int)(ry * height_);
+                int area_w = (int)(rw * width_);
+                int area_h = (int)(rh * height_);
+                
+                // 绘制区域框（蓝色边框）
+                cv::rectangle(frame_, cv::Point(area_x, area_y), 
+                            cv::Point(area_x + area_w, area_y + area_h), 
+                            cv::Scalar(255, 0, 0), 2);
+                
+                // 在区域框左上角添加标注文字
+                char area_text[64];
+                sprintf(area_text, "Detection Area");
+                cv::putText(frame_, area_text, cv::Point(area_x, area_y - 8), 
+                           cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 0), 2);
+            }
+            
             // 编码并推流
             memcpy(data_, frame_.data, width_ * height_ * 3);
             RK_MPI_VENC_SendFrame(0, &h264_frame_, -1);
