@@ -70,7 +70,7 @@ int vi_dev_init() {
 // 初始化视频输入通道（VI Channel），设置分辨率、格式、缓冲等
 int vi_chn_init(int channelId, int width, int height) {
 	int ret;
-	int buf_cnt = 2;
+	int buf_cnt = 3; // 增加缓冲区数量，提高吞吐
 	// VI init
 	VI_CHN_ATTR_S vi_chn_attr;
 	memset(&vi_chn_attr, 0, sizeof(vi_chn_attr));
@@ -81,7 +81,7 @@ int vi_chn_init(int channelId, int width, int height) {
 	vi_chn_attr.stSize.u32Height = height;
 	vi_chn_attr.enPixelFormat = RK_FMT_YUV420SP;
 	vi_chn_attr.enCompressMode = COMPRESS_MODE_NONE; // COMPRESS_AFBC_16x16;
-	vi_chn_attr.u32Depth = 2; //0, get fail, 1 - u32BufCount, can get, if bind to other device, must be < u32BufCount
+	vi_chn_attr.u32Depth = 1; // 降低深度，减少延迟
 	ret = RK_MPI_VI_SetChnAttr(0, channelId, &vi_chn_attr);
 	ret |= RK_MPI_VI_EnableChn(0, channelId);
 	if (ret) {
@@ -101,26 +101,30 @@ int venc_init(int chnId, int width, int height, RK_CODEC_ID_E enType) {
 
 	if (enType == RK_VIDEO_ID_AVC) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H264CBR;
-		stAttr.stRcAttr.stH264Cbr.u32BitRate = 10 * 1024;
-		stAttr.stRcAttr.stH264Cbr.u32Gop = 1;
+		stAttr.stRcAttr.stH264Cbr.u32BitRate = 8 * 1024; // 降低码率提高速度
+		stAttr.stRcAttr.stH264Cbr.u32Gop = 30; // 
+		stAttr.stRcAttr.stH264Cbr.u32SrcFrameRateNum = 30; // 设置源帧率
+		stAttr.stRcAttr.stH264Cbr.u32SrcFrameRateDen = 1;
+		stAttr.stRcAttr.stH264Cbr.fr32DstFrameRateNum = 30; // 目标帧率
+		stAttr.stRcAttr.stH264Cbr.fr32DstFrameRateDen = 1;
 	} else if (enType == RK_VIDEO_ID_HEVC) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
-		stAttr.stRcAttr.stH265Cbr.u32BitRate = 10 * 1024;
+		stAttr.stRcAttr.stH265Cbr.u32BitRate = 8 * 1024;
 		stAttr.stRcAttr.stH265Cbr.u32Gop = 60;
 	} else if (enType == RK_VIDEO_ID_MJPEG) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_MJPEGCBR;
-		stAttr.stRcAttr.stMjpegCbr.u32BitRate = 10 * 1024;
+		stAttr.stRcAttr.stMjpegCbr.u32BitRate = 8 * 1024;
 	}
 
 	stAttr.stVencAttr.enType = enType;
 	stAttr.stVencAttr.enPixelFormat = RK_FMT_RGB888;
 	if (enType == RK_VIDEO_ID_AVC)
-		stAttr.stVencAttr.u32Profile = H264E_PROFILE_HIGH;
+		stAttr.stVencAttr.u32Profile = H264E_PROFILE_BASELINE; // 改用Baseline更快
 	stAttr.stVencAttr.u32PicWidth = width;
 	stAttr.stVencAttr.u32PicHeight = height;
 	stAttr.stVencAttr.u32VirWidth = width;
 	stAttr.stVencAttr.u32VirHeight = height;
-	stAttr.stVencAttr.u32StreamBufCnt = 2;
+	stAttr.stVencAttr.u32StreamBufCnt = 4; // 增加缓冲
 	stAttr.stVencAttr.u32BufSize = width * height * 3 / 2;
 	stAttr.stVencAttr.enMirror = MIRROR_NONE;
 

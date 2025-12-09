@@ -13,13 +13,44 @@
 // 构造函数，初始化参数
 Video::Video(int width, int height, int model_width, int model_height)
     : width_(width), height_(height), model_width_(model_width), model_height_(model_height),
-      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), ai_enable_(false), area_enable_(false), obj_enable_(false), control_(nullptr), last_send_time_(0), send_interval_(DEFAULT_SEND_INTERVAL) {
+      H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), 
+      ai_enable_(false), area_enable_(false), obj_enable_(false), 
+      control_(nullptr), last_send_time_(0), send_interval_(DEFAULT_SEND_INTERVAL),
+      frame_count_(0), fps_start_time_(0), current_fps_(0.0f),
+      thread_capture_(0), thread_inference_(0), thread_encode_(0),
+      inference_frame_skip_(2) {  // 默认每3帧推理1次
+    
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
+    
+    // 初始化缓冲区
+    int yuv_size = width_ * height_ * 3 / 2;
+    capture_buffer_.yuv_data = (unsigned char*)malloc(yuv_size);
+    capture_buffer_.ready = false;
+    pthread_mutex_init(&capture_buffer_.mutex, NULL);
+    
+    inference_buffer_.yuv_data = (unsigned char*)malloc(yuv_size);
+    inference_buffer_.ready = false;
+    pthread_mutex_init(&inference_buffer_.mutex, NULL);
+    
+    pthread_mutex_init(&detection_mutex_, NULL);
 }
 
 // 析构函数，自动释放资源
 Video::~Video() {
     stop();
+    
+    pthread_mutex_destroy(&capture_buffer_.mutex);
+    pthread_mutex_destroy(&inference_buffer_.mutex);
+    pthread_mutex_destroy(&detection_mutex_);
+    
+    if (capture_buffer_.yuv_data) {
+        free(capture_buffer_.yuv_data);
+        capture_buffer_.yuv_data = NULL;
+    }
+    if (inference_buffer_.yuv_data) {
+        free(inference_buffer_.yuv_data);
+        inference_buffer_.yuv_data = NULL;
+    }
 }
 
 // 初始化所有资源（模型、ISP、VI、VENC、RTSP等）
@@ -77,18 +108,48 @@ bool Video::init() {
     return true;
 }
 
-// 启动主循环线程
+// 启动三线程
 bool Video::start() {
     running_ = true;
-    return pthread_create(&thread_, NULL, threadFunc, this) == 0;
+    
+    // 创建三个线程
+    if (pthread_create(&thread_capture_, NULL, captureThreadFunc, this) != 0) {
+        printf("[错误] 创建采集线程失败\n");
+        return false;
+    }
+    
+    if (pthread_create(&thread_inference_, NULL, inferenceThreadFunc, this) != 0) {
+        printf("[错误] 创建推理线程失败\n");
+        return false;
+    }
+    
+    if (pthread_create(&thread_encode_, NULL, encodeThreadFunc, this) != 0) {
+        printf("[错误] 创建编码线程失败\n");
+        return false;
+    }
+    
+    printf("[成功] 三线程启动: 采集、推理、编码推流\n");
+    return true;
 }
 
 // 停止线程并释放所有资源
 void Video::stop() {
     running_ = false;
-    if (thread_) {
-        pthread_join(thread_, NULL);
-        thread_ = 0;
+    
+    if (thread_capture_) {
+        pthread_join(thread_capture_, NULL);
+        thread_capture_ = 0;
+        printf("[线程] 采集线程已停止\n");
+    }
+    if (thread_inference_) {
+        pthread_join(thread_inference_, NULL);
+        thread_inference_ = 0;
+        printf("[线程] 推理线程已停止\n");
+    }
+    if (thread_encode_) {
+        pthread_join(thread_encode_, NULL);
+        thread_encode_ = 0;
+        printf("[线程] 编码线程已停止\n");
     }
     // 资源释放
     RK_MPI_MB_ReleaseMB(src_Blk_);
@@ -105,155 +166,413 @@ void Video::stop() {
     deinit_post_process();
 }
 
-// 线程入口，调用mainLoop
-void* Video::threadFunc(void* arg) {
-    
-    Video* self = static_cast<Video*>(arg);   
-    self->mainLoop(); 
+// ============ 线程入口函数 ============
+void* Video::captureThreadFunc(void* arg) {
+    Video* self = static_cast<Video*>(arg);
+    self->captureLoop();
     return nullptr;
 }
 
-// 主循环：采集、推理、编码、推流
-void Video::mainLoop() {
+void* Video::inferenceThreadFunc(void* arg) {
+    Video* self = static_cast<Video*>(arg);
+    self->inferenceLoop();
+    return nullptr;
+}
+
+void* Video::encodeThreadFunc(void* arg) {
+    Video* self = static_cast<Video*>(arg);
+    self->encodeLoop();
+    return nullptr;
+}
+
+// ============ 线程1: 采集循环 ============
+void Video::captureLoop() {
     RK_S32 s32Ret;
-    int sX, sY, eX, eY;
+    int frame_counter = 0;
+    int yuv_size = width_ * height_ * 3 / 2;
+    
+#ifdef ENABLE_PERFORMANCE_TIMING
+    struct timeval t_start, t_end;
+    long vi_time_us, memcpy_time_us;
+#endif
+    
+    printf("[采集线程] 启动\n");
+    
     while(running_) {
-        h264_frame_.stVFrame.u32TimeRef = H264_TimeRef_++;
-        h264_frame_.stVFrame.u64PTS = TEST_COMM_GetNowUs();
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_start, NULL);
+#endif
+        
         s32Ret = RK_MPI_VI_GetChnFrame(0, 0, &stViFrame_, -1);
-        if(s32Ret == RK_SUCCESS) {
-            void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame_.stVFrame.pMbBlk);
-            // YUV转BGR，OpenCV处理
-            cv::Mat yuv420sp(height_ + height_ / 2, width_, CV_8UC1, vi_data);
-            cv::Mat bgr(height_, width_, CV_8UC3, data_);
-            cv::cvtColor(yuv420sp, bgr, cv::COLOR_YUV420sp2BGR);
-            cv::resize(bgr, frame_, cv::Size(width_, height_), 0, 0, cv::INTER_LINEAR);
-            // letterbox处理，适配模型输入
-            cv::Mat letterboxImage = letterbox(frame_);
-            memcpy(rknn_app_ctx_.input_mems[0]->virt_addr, letterboxImage.data, model_width_ * model_height_ * 3);
-            if (ai_enable_) {
-                // 推理
-                inference_yolov5_model(&rknn_app_ctx_, &od_results_);
-                
-                // 清空上一帧的检测结果
-                current_detections_.clear();
-                
-                // 遍历所有检测到的目标
-                for(int i = 0; i < od_results_.count; i++) {
-                    if(od_results_.count >= 1) {
-                        object_detect_result *det_result = &(od_results_.results[i]);
-                        sX = (int)(det_result->box.left);
-                        sY = (int)(det_result->box.top);
-                        eX = (int)(det_result->box.right);
-                        eY = (int)(det_result->box.bottom);
-                        mapCoordinates(&sX, &sY);
-                        mapCoordinates(&eX, &eY);
-                        bool drawBox = true;
-                        // 对象识别容器过滤逻辑
-                        if (obj_enable_ && !video_objList.empty()) {
-                            bool found = false;
-                            for (size_t j = 0; j < video_objList.size(); ++j) {
-                                if (det_result->cls_id == video_objList[j]) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if (!found) drawBox = false; // 不在对象列表则过滤
-                        }
-                        if (area_enable_) {
-                            // 区域识别开启时，判断检测框是否整体在归一化区域内
-                            float rx = video_rectInfo.x;
-                            float ry = video_rectInfo.y;
-                            float rw = video_rectInfo.w;
-                            float rh = video_rectInfo.h;
-                            // 检测框左上、右下归一化坐标
-                            float left_norm = (float)sX / (float)width_;
-                            float top_norm = (float)sY / (float)height_;
-                            float right_norm = (float)eX / (float)width_;
-                            float bottom_norm = (float)eY / (float)height_;
-                            // 判断检测框是否完全在区域框内
-                            if (!(left_norm >= rx && right_norm <= rx+rw && top_norm >= ry && bottom_norm <= ry+rh)) {
-                                drawBox = false; // 只要有一边超出区域则过滤
-                            }
-                        }
-                        if (drawBox) {
-                            // 终端打印输出检测结果
-                            printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
-                            // 绘制检测框和标签
-                            cv::rectangle(frame_, cv::Point(sX, sY), cv::Point(eX, eY), cv::Scalar(0,255,0), 3);
-                            sprintf(text_, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-                            cv::putText(frame_, text_, cv::Point(sX, sY - 8), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0,255,0), 2);
-                            
-                            // 收集检测结果信息
-                            DetectionInfo detection;
-                            detection.cls_id = det_result->cls_id;
-                            detection.cls_name = coco_cls_to_name(det_result->cls_id);
-                            detection.x = sX;
-                            detection.y = sY;
-                            detection.w = eX - sX;
-                            detection.h = eY - sY;
-                            detection.confidence = det_result->prop;
-                            current_detections_.push_back(detection);
-                        }
-                    }
-                }            
-                // 检查是否需要发送检测结果（简化的时间控制）
-                if (!current_detections_.empty() && control_) {
-                    static time_t last_time = 0;  // 使用静态变量，更简单可靠
-                    time_t now = time(NULL);
-                    
-                    // 如果是第一次或者时间间隔足够
-                    if (last_time == 0 || (now - last_time) >= send_interval_) {
-                        std::string summary = buildDetectionSummary();
-                        control_->onDetectionSummary(summary);
-                        printf("发送检测结果汇总 (包含%zu个物体)\n", current_detections_.size());
-                        last_time = now;
+        if(s32Ret != RK_SUCCESS) {
+            continue; // 移除usleep，立即重试
+        }
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        vi_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+#endif
+        
+        void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame_.stVFrame.pMbBlk);
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // 1. 拷贝到编码缓冲区（每帧都要）
+        pthread_mutex_lock(&capture_buffer_.mutex);
+        memcpy(capture_buffer_.yuv_data, vi_data, yuv_size);
+        capture_buffer_.timestamp = TEST_COMM_GetNowUs();
+        capture_buffer_.ready = true;
+        pthread_mutex_unlock(&capture_buffer_.mutex);
+        
+        // 2. 按跳帧策略拷贝到推理缓冲区
+        if (ai_enable_ && (frame_counter % (inference_frame_skip_ + 1)) == 0) {
+            pthread_mutex_lock(&inference_buffer_.mutex);
+            if (!inference_buffer_.ready) {  // 避免覆盖未处理的帧
+                memcpy(inference_buffer_.yuv_data, vi_data, yuv_size);
+                inference_buffer_.timestamp = capture_buffer_.timestamp;
+                inference_buffer_.ready = true;
+            }
+            pthread_mutex_unlock(&inference_buffer_.mutex);
+        }
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        memcpy_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        
+        // 每30帧打印一次
+        if (frame_counter % 30 == 0) {
+            printf("[采集] VI获取: %ld us, 内存拷贝: %ld us, 总计: %ld us\n", 
+                   vi_time_us, memcpy_time_us, vi_time_us + memcpy_time_us);
+        }
+#endif
+        
+        RK_MPI_VI_ReleaseChnFrame(0, 0, &stViFrame_);
+        frame_counter++;
+    }
+    
+    printf("[采集线程] 退出\n");
+}
+
+// ============ 线程2: 推理循环 ============
+void Video::inferenceLoop() {
+    cv::Mat yuv_mat, bgr_mat;
+    int sX, sY, eX, eY;
+    int yuv_size = width_ * height_ * 3 / 2;
+    unsigned char* yuv_buffer = (unsigned char*)malloc(yuv_size);
+    
+#ifdef ENABLE_PERFORMANCE_TIMING
+    struct timeval t_start, t_end, t_total_start;
+    long cvt_time_us, letterbox_time_us, inference_time_us, total_time_us;
+    int inference_counter = 0;
+#endif
+    
+    printf("[推理线程] 启动\n");
+    
+    while(running_) {
+        if (!ai_enable_) {
+            usleep(100000);  // AI关闭时休眠100ms
+            continue;
+        }
+        
+        // 获取待推理帧
+        bool has_frame = false;
+        pthread_mutex_lock(&inference_buffer_.mutex);
+        if (inference_buffer_.ready) {
+            memcpy(yuv_buffer, inference_buffer_.yuv_data, yuv_size);
+            inference_buffer_.ready = false;
+            has_frame = true;
+        }
+        pthread_mutex_unlock(&inference_buffer_.mutex);
+        
+        if (!has_frame) {
+            usleep(10000); // 增加到10ms，减少CPU空转
+            continue;
+        }
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_total_start, NULL);
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // YUV转BGR（仅用于推理）
+        yuv_mat = cv::Mat(height_ + height_ / 2, width_, CV_8UC1, yuv_buffer);
+        bgr_mat = cv::Mat(height_, width_, CV_8UC3);
+        cv::cvtColor(yuv_mat, bgr_mat, cv::COLOR_YUV420sp2BGR);
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        cvt_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // letterbox + 推理
+        cv::Mat letterboxImage = letterbox(bgr_mat);
+        memcpy(rknn_app_ctx_.input_mems[0]->virt_addr, letterboxImage.data, 
+               model_width_ * model_height_ * 3);
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        letterbox_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        inference_yolov5_model(&rknn_app_ctx_, &od_results_);
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        inference_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        gettimeofday(&t_total_start, NULL);
+        total_time_us = (t_total_start.tv_sec - t_total_start.tv_sec) * 1000000 + (t_total_start.tv_usec - t_total_start.tv_usec);
+        total_time_us = cvt_time_us + letterbox_time_us + inference_time_us;
+        
+        inference_counter++;
+        if (inference_counter % 10 == 0) {
+            printf("[推理] YUV转BGR: %ld us, letterbox: %ld us, RKNN推理: %ld us, 总计: %ld us\n", 
+                   cvt_time_us, letterbox_time_us, inference_time_us, total_time_us);
+        }
+#endif
+        
+        // 处理检测结果
+        std::vector<DetectionInfo> temp_detections;
+        
+        for(int i = 0; i < od_results_.count; i++) {
+            object_detect_result *det_result = &(od_results_.results[i]);
+            sX = (int)(det_result->box.left);
+            sY = (int)(det_result->box.top);
+            eX = (int)(det_result->box.right);
+            eY = (int)(det_result->box.bottom);
+            mapCoordinates(&sX, &sY);
+            mapCoordinates(&eX, &eY);
+            
+            bool drawBox = true;
+            
+            // 对象过滤
+            if (obj_enable_ && !video_objList.empty()) {
+                bool found = false;
+                for (size_t j = 0; j < video_objList.size(); ++j) {
+                    if (det_result->cls_id == video_objList[j]) {
+                        found = true;
+                        break;
                     }
                 }
+                if (!found) drawBox = false;
             }
             
-            // 如果区域识别开启，在图像上绘制区域框
-            if (area_enable_) {
+            // 区域过滤
+            if (area_enable_ && drawBox) {
                 float rx = video_rectInfo.x;
                 float ry = video_rectInfo.y;
                 float rw = video_rectInfo.w;
                 float rh = video_rectInfo.h;
                 
-                // 将归一化坐标转换为像素坐标
-                int area_x = (int)(rx * width_);
-                int area_y = (int)(ry * height_);
-                int area_w = (int)(rw * width_);
-                int area_h = (int)(rh * height_);
+                float left_norm = (float)sX / (float)width_;
+                float top_norm = (float)sY / (float)height_;
+                float right_norm = (float)eX / (float)width_;
+                float bottom_norm = (float)eY / (float)height_;
                 
-                // 绘制区域框（蓝色边框）
-                cv::rectangle(frame_, cv::Point(area_x, area_y), 
-                            cv::Point(area_x + area_w, area_y + area_h), 
-                            cv::Scalar(255, 0, 0), 2);
-                
-                // 在区域框左上角添加标注文字
-                char area_text[64];
-                sprintf(area_text, "Detection Area");
-                cv::putText(frame_, area_text, cv::Point(area_x, area_y - 8), 
-                           cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 0), 2);
-            }
-            
-            // 编码并推流
-            memcpy(data_, frame_.data, width_ * height_ * 3);
-            RK_MPI_VENC_SendFrame(0, &h264_frame_, -1);
-            s32Ret = RK_MPI_VENC_GetStream(0, &stFrame_, -1);
-            if(s32Ret == RK_SUCCESS) {
-                if(g_rtsplive_ && g_rtsp_session_) {
-                    void *pData = RK_MPI_MB_Handle2VirAddr(stFrame_.pstPack->pMbBlk);
-                    rtsp_tx_video(g_rtsp_session_, (uint8_t *)pData, stFrame_.pstPack->u32Len, stFrame_.pstPack->u64PTS);
-                    rtsp_do_event(g_rtsplive_);
+                if (!(left_norm >= rx && right_norm <= rx+rw && 
+                      top_norm >= ry && bottom_norm <= ry+rh)) {
+                    drawBox = false;
                 }
             }
-            RK_MPI_VI_ReleaseChnFrame(0, 0, &stViFrame_);
-            RK_MPI_VENC_ReleaseStream(0, &stFrame_);
-            memset(text_, 0, 8);
+            
+            if (drawBox) {
+                printf("%s @ (%d %d %d %d) %.3f\n", 
+                       coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
+                
+                DetectionInfo detection;
+                detection.cls_id = det_result->cls_id;
+                detection.cls_name = coco_cls_to_name(det_result->cls_id);
+                detection.x = sX;
+                detection.y = sY;
+                detection.w = eX - sX;
+                detection.h = eY - sY;
+                detection.confidence = det_result->prop;
+                temp_detections.push_back(detection);
+            }
         }
-        usleep(1000); // 防止CPU占用过高
+        
+        // 更新共享检测结果
+        pthread_mutex_lock(&detection_mutex_);
+        shared_detections_.clear();
+        shared_detections_.assign(temp_detections.begin(), temp_detections.end());
+        pthread_mutex_unlock(&detection_mutex_);
+        
+        // 发送检测结果
+        if (!temp_detections.empty() && control_) {
+            static time_t last_time = 0;
+            time_t now = time(NULL);
+            if (last_time == 0 || (now - last_time) >= send_interval_) {
+                current_detections_ = temp_detections;
+                std::string summary = buildDetectionSummary();
+                control_->onDetectionSummary(summary);
+                printf("发送检测结果汇总 (包含%zu个物体)\n", temp_detections.size());
+                last_time = now;
+            }
+        }
     }
+    
+    free(yuv_buffer);
+    printf("[推理线程] 退出\n");
+}
+
+// ============ 线程3: 编码推流循环 ============
+void Video::encodeLoop() {
+    RK_S32 s32Ret;
+    cv::Mat yuv_mat, bgr_mat;
+    int yuv_size = width_ * height_ * 3 / 2;
+    unsigned char* yuv_buffer = (unsigned char*)malloc(yuv_size);
+    std::vector<DetectionInfo> local_detections;
+    
+    // FPS统计
+    frame_count_ = 0;
+    fps_start_time_ = time(NULL);
+    current_fps_ = 0.0f;
+    
+#ifdef ENABLE_PERFORMANCE_TIMING
+    struct timeval t_start, t_end, t_total_start;
+    long cvt_time_us, draw_time_us, encode_time_us, rtsp_time_us, total_time_us;
+    int encode_counter = 0;
+#endif
+    
+    printf("[编码线程] 启动\n");
+    
+    while(running_) {
+        // 获取采集帧
+        bool has_frame = false;
+        uint64_t timestamp;
+        
+        pthread_mutex_lock(&capture_buffer_.mutex);
+        if (capture_buffer_.ready) {
+            memcpy(yuv_buffer, capture_buffer_.yuv_data, yuv_size);
+            timestamp = capture_buffer_.timestamp;
+            capture_buffer_.ready = false;
+            has_frame = true;
+        }
+        pthread_mutex_unlock(&capture_buffer_.mutex);
+        
+        if (!has_frame) {
+            usleep(1000); // 减少到1ms，更快响应
+            continue;
+        }
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_total_start, NULL);
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // YUV转BGR（用于绘制）
+        yuv_mat = cv::Mat(height_ + height_ / 2, width_, CV_8UC1, yuv_buffer);
+        bgr_mat = cv::Mat(height_, width_, CV_8UC3, data_);
+        cv::cvtColor(yuv_mat, bgr_mat, cv::COLOR_YUV420sp2BGR);
+        cv::resize(bgr_mat, frame_, cv::Size(width_, height_), 0, 0, cv::INTER_LINEAR);
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        cvt_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // 获取最新检测结果
+        pthread_mutex_lock(&detection_mutex_);
+        local_detections.clear();
+        local_detections.assign(shared_detections_.begin(), shared_detections_.end());
+        pthread_mutex_unlock(&detection_mutex_);
+        
+        // 绘制检测框
+        if (ai_enable_ && !local_detections.empty()) {
+            for (const auto& det : local_detections) {
+                cv::rectangle(frame_, 
+                            cv::Point(det.x, det.y), 
+                            cv::Point(det.x + det.w, det.y + det.h), 
+                            cv::Scalar(0,255,0), 2); // 线宽从3改为2
+                
+                char text[64];
+                sprintf(text, "%s %.0f%%", det.cls_name.c_str(), det.confidence * 100); // 去掉小数
+                cv::putText(frame_, text, cv::Point(det.x, det.y - 8), 
+                           cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,0), 1); // 字体和线宽减小
+            }
+        }
+        
+        // 绘制区域框
+        if (area_enable_) {
+            int area_x = (int)(video_rectInfo.x * width_);
+            int area_y = (int)(video_rectInfo.y * height_);
+            int area_w = (int)(video_rectInfo.w * width_);
+            int area_h = (int)(video_rectInfo.h * height_);
+            
+            cv::rectangle(frame_, cv::Point(area_x, area_y), 
+                        cv::Point(area_x + area_w, area_y + area_h), 
+                        cv::Scalar(255, 0, 0), 1); // 线宽从2改为1
+            
+            cv::putText(frame_, "Area", cv::Point(area_x, area_y - 8), // 简化文字
+                       cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
+        }
+        
+        // 绘制FPS
+        frame_count_++;
+        time_t current_time = time(NULL);
+        if (current_time - fps_start_time_ >= 1) {
+            current_fps_ = (float)frame_count_;
+            frame_count_ = 0;
+            fps_start_time_ = current_time;
+        }
+        
+        if (current_fps_ > 0.0f) {
+            char fps_text[16];
+            sprintf(fps_text, "%.0f", current_fps_);
+            cv::putText(frame_, fps_text, 
+                       cv::Point(width_ - 50, height_ / 4), 
+                       cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1); // 字体和线宽减小
+        }
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        draw_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // 编码
+        h264_frame_.stVFrame.u32TimeRef = H264_TimeRef_++;
+        h264_frame_.stVFrame.u64PTS = timestamp;
+        memcpy(data_, frame_.data, width_ * height_ * 3);
+        
+        RK_MPI_VENC_SendFrame(0, &h264_frame_, -1);
+        s32Ret = RK_MPI_VENC_GetStream(0, &stFrame_, -1);
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        encode_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // 推流
+        if(s32Ret == RK_SUCCESS && g_rtsplive_ && g_rtsp_session_) {
+            void *pData = RK_MPI_MB_Handle2VirAddr(stFrame_.pstPack->pMbBlk);
+            rtsp_tx_video(g_rtsp_session_, (uint8_t *)pData, 
+                         stFrame_.pstPack->u32Len, stFrame_.pstPack->u64PTS);
+            rtsp_do_event(g_rtsplive_);
+        }
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        rtsp_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        total_time_us = cvt_time_us + draw_time_us + encode_time_us + rtsp_time_us;
+        
+        encode_counter++;
+        if (encode_counter % 30 == 0) {
+            printf("[编码] YUV转BGR: %ld us, 绘制: %ld us, H.264编码: %ld us, RTSP推流: %ld us, 总计: %ld us\n", 
+                   cvt_time_us, draw_time_us, encode_time_us, rtsp_time_us, total_time_us);
+        }
+#endif
+        
+        RK_MPI_VENC_ReleaseStream(0, &stFrame_);
+    }
+    
+    free(yuv_buffer);
+    printf("[编码线程] 退出\n");
 }
 
 // letterbox处理：缩放+填充，适配模型输入

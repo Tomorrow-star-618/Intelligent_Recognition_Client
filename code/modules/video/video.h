@@ -2,11 +2,16 @@
 #ifndef VIDEO_H
 #define VIDEO_H
 
+// 性能计时开关：定义此宏以启用各线程处理时间统计（用于性能调优）
+#define ENABLE_PERFORMANCE_TIMING
+
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <pthread.h>
 #include <time.h>
+#include <sys/time.h>
+#include <stdint.h>
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
 #include "yolov5.h"
@@ -57,10 +62,24 @@ public:
          
 
 private:
-    // 线程入口函数
-    static void* threadFunc(void* arg);
-    // 主循环，采集、推理、编码、推流
-    void mainLoop();
+    // 检测结果信息结构
+    struct DetectionInfo {
+        int cls_id;
+        std::string cls_name;
+        int x, y, w, h;
+        float confidence;
+    };
+    
+    // 三个线程入口函数
+    static void* captureThreadFunc(void* arg);
+    static void* inferenceThreadFunc(void* arg);
+    static void* encodeThreadFunc(void* arg);
+    
+    // 三个线程的主循环
+    void captureLoop();      // 采集循环
+    void inferenceLoop();    // 推理循环
+    void encodeLoop();       // 编码推流循环
+    
     // letterbox处理，适配模型输入
     cv::Mat letterbox(cv::Mat input);
     // 坐标映射回原图
@@ -96,13 +115,31 @@ private:
     rtsp_demo_handle g_rtsplive_;
     rtsp_session_handle g_rtsp_session_;
 
-    // 线程相关
-    pthread_t thread_;
+    // 三线程相关
+    pthread_t thread_capture_;    // 采集线程
+    pthread_t thread_inference_;  // 推理线程
+    pthread_t thread_encode_;     // 编码推流线程
     bool running_;
     bool ai_enable_;      // AI识别开关标志
     bool area_enable_;    // 区域识别开关标志
     bool obj_enable_;     // 对象识别开关标志
     bool rtsp_enable_;    // RTSP推流开关标志
+    
+    // 线程间共享缓冲区
+    struct FrameBuffer {
+        unsigned char* yuv_data;
+        uint64_t timestamp;
+        bool ready;
+        pthread_mutex_t mutex;
+    };
+    FrameBuffer capture_buffer_;     // 采集->编码
+    FrameBuffer inference_buffer_;   // 采集->推理
+    
+    // 共享检测结果（推理->编码）
+    std::vector<DetectionInfo> shared_detections_;
+    pthread_mutex_t detection_mutex_;
+    
+    int inference_frame_skip_;       // 推理跳帧计数（每N+1帧推理1次）
 
     // 矩形框信息
     RectInfo video_rectInfo;
@@ -116,14 +153,12 @@ private:
     int send_interval_;            // 发送间隔（秒），可动态调整
     static const int DEFAULT_SEND_INTERVAL = 1; // 默认发送间隔（秒）
     
-    // 当前帧检测结果存储
-    struct DetectionInfo {
-        int cls_id;
-        std::string cls_name;
-        int x, y, w, h;
-        float confidence;
-    };
     std::vector<DetectionInfo> current_detections_;
+    
+    // 帧率计算相关
+    int frame_count_;              // 帧计数器
+    time_t fps_start_time_;        // FPS计算开始时间
+    float current_fps_;            // 当前FPS值
 };
 
 #endif // VIDEO_H

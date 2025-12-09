@@ -13,8 +13,8 @@
 #include "video.h"
 #include "tcp.h"
 
-#define DISP_WIDTH  720   // 显示宽度
-#define DISP_HEIGHT 480   // 显示高度
+#define DISP_WIDTH  1280  // 显示宽度（提升到720p）
+#define DISP_HEIGHT 720   // 显示高度（提升到720p）
 
 bool quit = false;
 
