@@ -19,7 +19,7 @@
 // 值为 N 表示每 (N+1) 帧推理一次
 // 例如：2 表示每3帧推理1次（跳过2帧）
 //      4 表示每5帧推理1次（跳过4帧）
-#define INFERENCE_FRAME_SKIP 4
+#define INFERENCE_FRAME_SKIP 3
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -166,9 +166,12 @@ private:
     };
     BGRFrameBuffer bgr_buffer_;      // BGR转换线程输出 -> 编码线程输入
     
-    // 推理专用BGR缓冲区（BGR转换线程 -> 推理线程，跳帧传递）
+    // 推理专用BGR三缓冲区（零拷贝优化：write/ready/read指针轮换）
+    // 原理：BGR转换线程浅拷贝到write，轮换指针给推理线程，避免18ms深拷贝
     struct InferenceBGRBuffer {
-        cv::Mat bgr_data;            // BGR数据（深拷贝，避免与编码线程冲突）
+        cv::Mat* bgr_write;          // 写缓冲（BGR转换线程独占，浅拷贝）
+        cv::Mat* bgr_ready;          // 就绪缓冲（等待推理线程消费）
+        cv::Mat* bgr_read;           // 读缓冲（推理线程独占）
         int frame_index;             // 帧序号（配合跳帧逻辑）
         bool ready;                  // 数据就绪标志
         pthread_mutex_t mutex;       // 互斥锁
@@ -178,6 +181,10 @@ private:
     // 共享检测结果（推理->编码，互斥锁保护）
     std::vector<DetectionInfo> shared_detections_;
     pthread_mutex_t detection_mutex_;
+    
+    // 检测结果缓存（编码线程本地缓存，避免每帧都卡顿）
+    std::vector<DetectionInfo> cached_detections_;  // 上次推理结果缓存
+    bool has_detection_result_;                      // 是否有过推理结果
     
     int inference_frame_skip_;       // 推理跳帧计数（每N+1帧推理1次，当前N=2）
 

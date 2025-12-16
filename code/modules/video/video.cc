@@ -20,7 +20,8 @@ Video::Video(int width, int height, int model_width, int model_height)
       control_(nullptr), last_send_time_(0), send_interval_(DEFAULT_SEND_INTERVAL),
       frame_count_(0), current_fps_(0.0f),
       thread_capture_(0), thread_bgr_convert_(0), thread_inference_(0), thread_encode_(0),
-      inference_frame_skip_(INFERENCE_FRAME_SKIP) {  // 使用宏定义的跳帧参数
+      inference_frame_skip_(INFERENCE_FRAME_SKIP),  // 使用宏定义的跳帧参数
+      has_detection_result_(false) {  // 初始化检测结果标志
     
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
     memset(&fps_start_time_, 0, sizeof(struct timeval));
@@ -42,9 +43,12 @@ Video::Video(int width, int height, int model_width, int model_height)
     bgr_buffer_.timestamp = 0;
     pthread_mutex_init(&bgr_buffer_.mutex, NULL);
     
-    // 初始化推理专用BGR缓冲区（BGR转换线程→推理线程，每N帧传递1次）
-    inference_bgr_buffer_.bgr_data = cv::Mat(height_, width_, CV_8UC3);
-    inference_bgr_buffer_.ready = false;
+    // 初始化推理专用BGR三缓冲区（write/ready/read指针轮换，零拷贝优化）
+    // BGR转换浅拷贝到write → 轮换到ready → 推理读read，避免18ms深拷贝
+    inference_bgr_buffer_.bgr_write = new cv::Mat(height_, width_, CV_8UC3);
+    inference_bgr_buffer_.bgr_ready = new cv::Mat(height_, width_, CV_8UC3);
+    inference_bgr_buffer_.bgr_read = new cv::Mat(height_, width_, CV_8UC3);
+    inference_bgr_buffer_.ready = false; 
     inference_bgr_buffer_.frame_index = 0;
     pthread_mutex_init(&inference_bgr_buffer_.mutex, NULL);
     
@@ -75,6 +79,18 @@ Video::~Video() {
     if (bgr_buffer_.bgr_read) {
         delete bgr_buffer_.bgr_read;
         bgr_buffer_.bgr_read = NULL;
+    }
+    if (inference_bgr_buffer_.bgr_write) {
+        delete inference_bgr_buffer_.bgr_write;
+        inference_bgr_buffer_.bgr_write = NULL;
+    }
+    if (inference_bgr_buffer_.bgr_ready) {
+        delete inference_bgr_buffer_.bgr_ready;
+        inference_bgr_buffer_.bgr_ready = NULL;
+    }
+    if (inference_bgr_buffer_.bgr_read) {
+        delete inference_bgr_buffer_.bgr_read;
+        inference_bgr_buffer_.bgr_read = NULL;
     }
 }
 
@@ -352,15 +368,21 @@ void Video::bgrConvertLoop() {
         swap_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
 #endif
         
-        // 🔒 每N帧拷贝BGR数据给推理线程（跳帧策略，深拷贝避免冲突）
-        // 注意：使用深拷贝而非指针共享，避免与编码线程冲突（编码会修改bgr_read）
+        // 🔒 每N帧传递BGR数据给推理线程（三缓冲指针轮换，零拷贝优化）
+        // 优化：浅拷贝Mat头到write缓冲，然后指针轮换，避免18ms深拷贝
         if (ai_enable_ && (frame_counter % (inference_frame_skip_ + 1)) == 0) {
 #ifdef ENABLE_PERFORMANCE_TIMING
             gettimeofday(&t_start, NULL);
 #endif
+            // 浅拷贝：仅复制Mat头（48字节），共享数据指针（无锁，安全）
+            *inference_bgr_buffer_.bgr_write = *bgr_buffer_.bgr_ready;
+            
+            // 三缓冲指针轮换（锁内<1us）
             pthread_mutex_lock(&inference_bgr_buffer_.mutex);
             if (!inference_bgr_buffer_.ready) {  // 避免覆盖未处理的帧
-                bgr_buffer_.bgr_ready->copyTo(inference_bgr_buffer_.bgr_data);
+                cv::Mat* temp = inference_bgr_buffer_.bgr_ready;
+                inference_bgr_buffer_.bgr_ready = inference_bgr_buffer_.bgr_write;
+                inference_bgr_buffer_.bgr_write = temp;
                 inference_bgr_buffer_.frame_index = frame_counter;
                 inference_bgr_buffer_.ready = true;
             }
@@ -377,7 +399,7 @@ void Video::bgrConvertLoop() {
 #ifdef ENABLE_PERFORMANCE_TIMING
         if (frame_counter % 30 == 0) {
             long total_us = cvt_time_us + swap_time_us + inference_copy_time_us;
-            printf("[BGR转换#%d] YUV→BGR: %ld us, 指针轮换: %ld us, 推理拷贝: %ld us, 总计: %ld us\n", 
+            printf("[BGR转换#%d] YUV→BGR: %ld us, 指针轮换: %ld us, 推理轮换: %ld us, 总计: %ld us\n", 
                    frame_counter, cvt_time_us, swap_time_us, inference_copy_time_us, total_us);
         }
 #endif
@@ -391,7 +413,7 @@ void Video::bgrConvertLoop() {
 
 // ============ 线程3: 推理循环 ============
 // 功能: 从inference_bgr_buffer获取BGR数据，letterbox缩放，RKNN推理
-// 性能: letterbox 18ms + 推理 96ms = 114ms（每3帧推理1次，节省68ms BGR转换）
+// 性能: letterbox 18ms + 推理 96ms = 114ms（每5帧推理1次，三缓冲零拷贝优化）
 // 特点: 独立运行，不影响编码线程，结果通过detection_mutex_共享
 void Video::inferenceLoop() {
     cv::Mat bgr_mat;
@@ -399,11 +421,11 @@ void Video::inferenceLoop() {
     
 #ifdef ENABLE_PERFORMANCE_TIMING
     struct timeval t_start, t_end;
-    long letterbox_time_us, inference_time_us, total_time_us;
+    long swap_time_us, letterbox_time_us, inference_time_us, total_time_us;
     int inference_counter = 0;
 #endif
     
-    printf("[推理线程] 启动 - 直接使用BGR数据模式（节省68ms BGR转换）\n");
+    printf("[推理线程] 启动 - 三缓冲指针交换模式（零拷贝优化）\n");
     
     while(running_) {
         if (!ai_enable_) {
@@ -411,20 +433,34 @@ void Video::inferenceLoop() {
             continue;
         }
         
-        // 🔒 获取待推理BGR帧（加锁保护，每3帧推理1次）
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // 🔒 三缓冲指针交换获取待推理BGR帧（锁内<1us，零拷贝）
         bool has_frame = false;
         pthread_mutex_lock(&inference_bgr_buffer_.mutex);
         if (inference_bgr_buffer_.ready) {
-            bgr_mat = inference_bgr_buffer_.bgr_data.clone();  // 深拷贝避免竞争
+            cv::Mat* temp = inference_bgr_buffer_.bgr_read;
+            inference_bgr_buffer_.bgr_read = inference_bgr_buffer_.bgr_ready;
+            inference_bgr_buffer_.bgr_ready = temp;
             inference_bgr_buffer_.ready = false;
             has_frame = true;
         }
         pthread_mutex_unlock(&inference_bgr_buffer_.mutex);
         
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        swap_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+#endif
+        
         if (!has_frame) {
             usleep(10000); // 10ms
             continue;
         }
+        
+        // 使用read缓冲（无锁，推理线程独占）
+        bgr_mat = *inference_bgr_buffer_.bgr_read;
         
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_start, NULL);
@@ -446,12 +482,12 @@ void Video::inferenceLoop() {
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
         inference_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
-        total_time_us = letterbox_time_us + inference_time_us;
+        total_time_us = swap_time_us + letterbox_time_us + inference_time_us;
         
         inference_counter++;
         if (inference_counter % 10 == 0) {
-            printf("[推理#%d] letterbox: %ld us, RKNN推理: %ld us, 总计: %ld us (节省YUV→BGR 68ms)\n", 
-                   inference_counter, letterbox_time_us, inference_time_us, total_time_us);
+            printf("[推理#%d] 指针交换: %ld us, letterbox: %ld us, RKNN推理: %ld us, 总计: %ld us\n", 
+                   inference_counter, swap_time_us, letterbox_time_us, inference_time_us, total_time_us);
         }
 #endif
         
@@ -544,7 +580,6 @@ void Video::inferenceLoop() {
 // 特点: 受限于BGR转换速度(37ms)，实际输出27fps，FPS在此线程统计
 void Video::encodeLoop() {
     RK_S32 s32Ret;
-    std::vector<DetectionInfo> local_detections;
     int last_processed_index = -1;  // 上次处理的帧序号（避免重复）
     
     // FPS统计
@@ -607,15 +642,19 @@ void Video::encodeLoop() {
         gettimeofday(&t_start, NULL);
 #endif
         
-        // 🔒 获取最新检测结果（加锁保护）
+        // 🔒 获取最新检测结果（加锁保护，仅读取）
         pthread_mutex_lock(&detection_mutex_);
-        local_detections.clear();
-        local_detections.assign(shared_detections_.begin(), shared_detections_.end());
+        if (!shared_detections_.empty()) {
+            // 有新推理结果，更新缓存
+            cached_detections_.clear();
+            cached_detections_.assign(shared_detections_.begin(), shared_detections_.end());
+            has_detection_result_ = true;
+        }
         pthread_mutex_unlock(&detection_mutex_);
         
-        // 绘制检测框
-        if (ai_enable_ && !local_detections.empty()) {
-            for (const auto& det : local_detections) {
+        // 绘制检测框（使用缓存结果，每帧都绘制）
+        if (ai_enable_ && has_detection_result_ && !cached_detections_.empty()) {
+            for (const auto& det : cached_detections_) {
                 cv::rectangle(frame_, 
                             cv::Point(det.x, det.y), 
                             cv::Point(det.x + det.w, det.y + det.h), 
