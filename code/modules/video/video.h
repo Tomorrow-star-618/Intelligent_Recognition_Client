@@ -1,9 +1,25 @@
-// video.h - 视频处理模块头文件，封装推理、采集、编码、推流等功能，支持线程化
+// video.h - 视频处理模块头文件
+// 四线程架构封装：采集、BGR转换、推理、编码推流
+// 性能优化：三缓冲区零拷贝、跳帧推理、硬件编码
 #ifndef VIDEO_H
 #define VIDEO_H
 
 // 性能计时开关：定义此宏以启用各线程处理时间统计（用于性能调优）
 #define ENABLE_PERFORMANCE_TIMING
+
+// 图像分辨率配置宏（用于采集和编码）
+#define IMAGE_WIDTH  1024    // 采集图像宽度
+#define IMAGE_HEIGHT 600     // 采集图像高度
+
+// 模型输入分辨率配置宏（用于推理）
+#define MODEL_WIDTH  640     // 模型输入宽度
+#define MODEL_HEIGHT 640     // 模型输入高度
+
+// 推理帧率配置宏（用于控制推理频率）
+// 值为 N 表示每 (N+1) 帧推理一次
+// 例如：2 表示每3帧推理1次（跳过2帧）
+//      4 表示每5帧推理1次（跳过4帧）
+#define INFERENCE_FRAME_SKIP 4
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -70,17 +86,19 @@ private:
         float confidence;
     };
     
-    // 三个线程入口函数
+    // 四个线程入口函数
     static void* captureThreadFunc(void* arg);
+    static void* bgrConvertThreadFunc(void* arg);  // BGR转换线程入口
     static void* inferenceThreadFunc(void* arg);
     static void* encodeThreadFunc(void* arg);
     
-    // 三个线程的主循环
-    void captureLoop();      // 采集循环
-    void inferenceLoop();    // 推理循环
-    void encodeLoop();       // 编码推流循环
+    // 四个线程的主循环
+    void captureLoop();      // 采集循环：VI获取YUV→快速拷贝(32ms)
+    void bgrConvertLoop();   // BGR转换循环：YUV→BGR转换(37ms瓶颈)+指针轮换
+    void inferenceLoop();    // 推理循环：BGR+letterbox+RKNN(182ms,每3帧)
+    void encodeLoop();       // 编码推流循环：绘制+H.264+RTSP(15ms)
     
-    // letterbox处理，适配模型输入
+    // letterbox处理，适配模型输入（INTER_NEAREST优化）
     cv::Mat letterbox(cv::Mat input);
     // 坐标映射回原图
     void mapCoordinates(int *x, int *y);
@@ -115,31 +133,53 @@ private:
     rtsp_demo_handle g_rtsplive_;
     rtsp_session_handle g_rtsp_session_;
 
-    // 三线程相关
-    pthread_t thread_capture_;    // 采集线程
-    pthread_t thread_inference_;  // 推理线程
-    pthread_t thread_encode_;     // 编码推流线程
+    // 四线程相关
+    pthread_t thread_capture_;       // 采集线程（VI硬件获取YUV）
+    pthread_t thread_bgr_convert_;   // BGR转换线程（YUV→BGR，37ms瓶颈）
+    pthread_t thread_inference_;     // 推理线程（RKNN AI检测，每3帧）
+    pthread_t thread_encode_;        // 编码推流线程（H.264+RTSP）
     bool running_;
     bool ai_enable_;      // AI识别开关标志
     bool area_enable_;    // 区域识别开关标志
     bool obj_enable_;     // 对象识别开关标志
     bool rtsp_enable_;    // RTSP推流开关标志
     
-    // 线程间共享缓冲区
+    // 线程间共享缓冲区（生产者-消费者模式，互斥锁保护）
     struct FrameBuffer {
         unsigned char* yuv_data;
         uint64_t timestamp;
         bool ready;
         pthread_mutex_t mutex;
     };
-    FrameBuffer capture_buffer_;     // 采集->编码
-    FrameBuffer inference_buffer_;   // 采集->推理
+    FrameBuffer capture_buffer_;     // 采集->BGR转换（YUV数据）
     
-    // 共享检测结果（推理->编码）
+    // BGR三缓冲区（零拷贝优化：write/ready/read指针轮换）
+    // 原理：转换完成时交换指针而非拷贝数据（8字节vs2.7MB）
+    struct BGRFrameBuffer {
+        cv::Mat* bgr_write;          // 写缓冲（BGR转换线程独占）
+        cv::Mat* bgr_ready;          // 就绪缓冲（等待编码线程消费）
+        cv::Mat* bgr_read;           // 读缓冲（编码线程独占）
+        uint64_t timestamp;          // 时间戳
+        int frame_index;             // 帧序号（避免重复处理）
+        bool ready;                  // 数据就绪标志
+        pthread_mutex_t mutex;       // 互斥锁
+    };
+    BGRFrameBuffer bgr_buffer_;      // BGR转换线程输出 -> 编码线程输入
+    
+    // 推理专用BGR缓冲区（BGR转换线程 -> 推理线程，跳帧传递）
+    struct InferenceBGRBuffer {
+        cv::Mat bgr_data;            // BGR数据（深拷贝，避免与编码线程冲突）
+        int frame_index;             // 帧序号（配合跳帧逻辑）
+        bool ready;                  // 数据就绪标志
+        pthread_mutex_t mutex;       // 互斥锁
+    };
+    InferenceBGRBuffer inference_bgr_buffer_;  // BGR转换线程输出 -> 推理线程输入
+    
+    // 共享检测结果（推理->编码，互斥锁保护）
     std::vector<DetectionInfo> shared_detections_;
     pthread_mutex_t detection_mutex_;
     
-    int inference_frame_skip_;       // 推理跳帧计数（每N+1帧推理1次）
+    int inference_frame_skip_;       // 推理跳帧计数（每N+1帧推理1次，当前N=2）
 
     // 矩形框信息
     RectInfo video_rectInfo;
@@ -155,10 +195,11 @@ private:
     
     std::vector<DetectionInfo> current_detections_;
     
-    // 帧率计算相关
+    // 帧率计算相关（使用高精度时间，微秒级）
     int frame_count_;              // 帧计数器
-    time_t fps_start_time_;        // FPS计算开始时间
-    float current_fps_;            // 当前FPS值
+    struct timeval fps_start_time_;  // FPS计算开始时间（微秒精度）
+    struct timeval program_start_time_; // 程序启动时间（用于运行时间显示）
+    float current_fps_;            // 当前FPS值（编码线程统计）
 };
 
 #endif // VIDEO_H

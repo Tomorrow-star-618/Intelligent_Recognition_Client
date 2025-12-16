@@ -13,9 +13,6 @@
 #include "video.h"
 #include "tcp.h"
 
-#define DISP_WIDTH  1280  // 显示宽度（提升到720p）
-#define DISP_HEIGHT 720   // 显示高度（提升到720p）
-
 bool quit = false;
 
 static void sigterm_handler(int sig) {
@@ -26,10 +23,11 @@ static void sigterm_handler(int sig) {
 // 主程序入口
 int main(int argc, char *argv[]) 
 {
-    int width = DISP_WIDTH;
-    int height = DISP_HEIGHT;
-    int model_width = 640;
-    int model_height = 640;
+    // 使用video.h中定义的宏来设置分辨率参数
+    int width = IMAGE_WIDTH;
+    int height = IMAGE_HEIGHT;
+    int model_width = MODEL_WIDTH;
+    int model_height = MODEL_HEIGHT;
 
     // 注册信号处理函数，捕获 SIGINT 和 SIGTERM
     //signal(SIGINT, sigterm_handler);

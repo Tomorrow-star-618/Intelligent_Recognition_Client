@@ -1,4 +1,6 @@
-// video.cc - 视频处理模块实现，采集、推理、编码、推流等功能，支持线程化
+// video.cc - 视频处理模块实现
+// 四线程架构：采集(30fps) → BGR转换(27fps瓶颈) → 编码推流(27fps) + 独立推理(每3帧)
+// 性能：RV1106硬件限制，BGR转换37ms为瓶颈，系统稳定27fps
 #include "video.h"
 #include "control.h"
 #include <stdio.h>
@@ -10,27 +12,41 @@
 #include <iomanip>
 
 
-// 构造函数，初始化参数
+// 构造函数，初始化参数和三级缓冲区
 Video::Video(int width, int height, int model_width, int model_height)
     : width_(width), height_(height), model_width_(model_width), model_height_(model_height),
       H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), 
       ai_enable_(false), area_enable_(false), obj_enable_(false), 
       control_(nullptr), last_send_time_(0), send_interval_(DEFAULT_SEND_INTERVAL),
-      frame_count_(0), fps_start_time_(0), current_fps_(0.0f),
-      thread_capture_(0), thread_inference_(0), thread_encode_(0),
-      inference_frame_skip_(2) {  // 默认每3帧推理1次
+      frame_count_(0), current_fps_(0.0f),
+      thread_capture_(0), thread_bgr_convert_(0), thread_inference_(0), thread_encode_(0),
+      inference_frame_skip_(INFERENCE_FRAME_SKIP) {  // 使用宏定义的跳帧参数
     
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
+    memset(&fps_start_time_, 0, sizeof(struct timeval));
+    memset(&program_start_time_, 0, sizeof(struct timeval));
     
-    // 初始化缓冲区
+    // 初始化YUV缓冲区（采集 → BGR转换）
     int yuv_size = width_ * height_ * 3 / 2;
     capture_buffer_.yuv_data = (unsigned char*)malloc(yuv_size);
     capture_buffer_.ready = false;
     pthread_mutex_init(&capture_buffer_.mutex, NULL);
     
-    inference_buffer_.yuv_data = (unsigned char*)malloc(yuv_size);
-    inference_buffer_.ready = false;
-    pthread_mutex_init(&inference_buffer_.mutex, NULL);
+    // 初始化BGR三缓冲区（write/ready/read指针轮换，避免拷贝阻塞）
+    // BGR转换写write → 轮换到ready → 编码读read，完全无锁操作
+    bgr_buffer_.bgr_write = new cv::Mat(height_, width_, CV_8UC3);
+    bgr_buffer_.bgr_ready = new cv::Mat(height_, width_, CV_8UC3);
+    bgr_buffer_.bgr_read = new cv::Mat(height_, width_, CV_8UC3);
+    bgr_buffer_.ready = false;
+    bgr_buffer_.frame_index = 0;
+    bgr_buffer_.timestamp = 0;
+    pthread_mutex_init(&bgr_buffer_.mutex, NULL);
+    
+    // 初始化推理专用BGR缓冲区（BGR转换线程→推理线程，每N帧传递1次）
+    inference_bgr_buffer_.bgr_data = cv::Mat(height_, width_, CV_8UC3);
+    inference_bgr_buffer_.ready = false;
+    inference_bgr_buffer_.frame_index = 0;
+    pthread_mutex_init(&inference_bgr_buffer_.mutex, NULL);
     
     pthread_mutex_init(&detection_mutex_, NULL);
 }
@@ -40,16 +56,25 @@ Video::~Video() {
     stop();
     
     pthread_mutex_destroy(&capture_buffer_.mutex);
-    pthread_mutex_destroy(&inference_buffer_.mutex);
+    pthread_mutex_destroy(&inference_bgr_buffer_.mutex);
     pthread_mutex_destroy(&detection_mutex_);
+    pthread_mutex_destroy(&bgr_buffer_.mutex);
     
     if (capture_buffer_.yuv_data) {
         free(capture_buffer_.yuv_data);
         capture_buffer_.yuv_data = NULL;
     }
-    if (inference_buffer_.yuv_data) {
-        free(inference_buffer_.yuv_data);
-        inference_buffer_.yuv_data = NULL;
+    if (bgr_buffer_.bgr_write) {
+        delete bgr_buffer_.bgr_write;
+        bgr_buffer_.bgr_write = NULL;
+    }
+    if (bgr_buffer_.bgr_ready) {
+        delete bgr_buffer_.bgr_ready;
+        bgr_buffer_.bgr_ready = NULL;
+    }
+    if (bgr_buffer_.bgr_read) {
+        delete bgr_buffer_.bgr_read;
+        bgr_buffer_.bgr_read = NULL;
     }
 }
 
@@ -112,9 +137,14 @@ bool Video::init() {
 bool Video::start() {
     running_ = true;
     
-    // 创建三个线程
+    // 创建四个线程
     if (pthread_create(&thread_capture_, NULL, captureThreadFunc, this) != 0) {
         printf("[错误] 创建采集线程失败\n");
+        return false;
+    }
+    
+    if (pthread_create(&thread_bgr_convert_, NULL, bgrConvertThreadFunc, this) != 0) {
+        printf("[错误] 创建BGR转换线程失败\n");
         return false;
     }
     
@@ -128,7 +158,7 @@ bool Video::start() {
         return false;
     }
     
-    printf("[成功] 三线程启动: 采集、推理、编码推流\n");
+    printf("[成功] 四线程启动: 采集、BGR转换、推理、编码推流\n");
     return true;
 }
 
@@ -140,6 +170,11 @@ void Video::stop() {
         pthread_join(thread_capture_, NULL);
         thread_capture_ = 0;
         printf("[线程] 采集线程已停止\n");
+    }
+    if (thread_bgr_convert_) {
+        pthread_join(thread_bgr_convert_, NULL);
+        thread_bgr_convert_ = 0;
+        printf("[线程] BGR转换线程已停止\n");
     }
     if (thread_inference_) {
         pthread_join(thread_inference_, NULL);
@@ -173,6 +208,12 @@ void* Video::captureThreadFunc(void* arg) {
     return nullptr;
 }
 
+void* Video::bgrConvertThreadFunc(void* arg) {
+    Video* self = static_cast<Video*>(arg);
+    self->bgrConvertLoop();
+    return nullptr;
+}
+
 void* Video::inferenceThreadFunc(void* arg) {
     Video* self = static_cast<Video*>(arg);
     self->inferenceLoop();
@@ -186,6 +227,9 @@ void* Video::encodeThreadFunc(void* arg) {
 }
 
 // ============ 线程1: 采集循环 ============
+// 功能: 从VI硬件获取YUV帧，快速拷贝到capture_buffer
+// 性能: VI获取30ms + YUV拷贝2ms = 32ms → 稳定30fps
+// 特点: 不等待消费，直接覆盖旧数据，保证实时性（允许下游丢帧）
 void Video::captureLoop() {
     RK_S32 s32Ret;
     int frame_counter = 0;
@@ -193,10 +237,10 @@ void Video::captureLoop() {
     
 #ifdef ENABLE_PERFORMANCE_TIMING
     struct timeval t_start, t_end;
-    long vi_time_us, memcpy_time_us;
+    long vi_time_us, copy_time_us, total_time_us;
 #endif
     
-    printf("[采集线程] 启动\n");
+    printf("[采集线程] 启动 - YUV快速拷贝模式（30fps）\n");
     
     while(running_) {
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -205,46 +249,35 @@ void Video::captureLoop() {
         
         s32Ret = RK_MPI_VI_GetChnFrame(0, 0, &stViFrame_, -1);
         if(s32Ret != RK_SUCCESS) {
-            continue; // 移除usleep，立即重试
+            continue; // 立即重试
         }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
         vi_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
-#endif
-        
-        void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame_.stVFrame.pMbBlk);
-        
-#ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_start, NULL);
 #endif
         
-        // 1. 拷贝到编码缓冲区（每帧都要）
+        void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame_.stVFrame.pMbBlk);
+        uint64_t timestamp = TEST_COMM_GetNowUs();
+        
+        // 🔒 快速拷贝YUV到BGR转换缓冲区（每帧都要，~2ms，加锁保护）
+        // 注意：不检查ready标志，直接覆盖，BGR转换线程会丢帧（保证采集30fps实时性）
         pthread_mutex_lock(&capture_buffer_.mutex);
         memcpy(capture_buffer_.yuv_data, vi_data, yuv_size);
-        capture_buffer_.timestamp = TEST_COMM_GetNowUs();
+        capture_buffer_.timestamp = timestamp;
         capture_buffer_.ready = true;
         pthread_mutex_unlock(&capture_buffer_.mutex);
         
-        // 2. 按跳帧策略拷贝到推理缓冲区
-        if (ai_enable_ && (frame_counter % (inference_frame_skip_ + 1)) == 0) {
-            pthread_mutex_lock(&inference_buffer_.mutex);
-            if (!inference_buffer_.ready) {  // 避免覆盖未处理的帧
-                memcpy(inference_buffer_.yuv_data, vi_data, yuv_size);
-                inference_buffer_.timestamp = capture_buffer_.timestamp;
-                inference_buffer_.ready = true;
-            }
-            pthread_mutex_unlock(&inference_buffer_.mutex);
-        }
-        
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
-        memcpy_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        copy_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        total_time_us = vi_time_us + copy_time_us;
         
         // 每30帧打印一次
         if (frame_counter % 30 == 0) {
-            printf("[采集] VI获取: %ld us, 内存拷贝: %ld us, 总计: %ld us\n", 
-                   vi_time_us, memcpy_time_us, vi_time_us + memcpy_time_us);
+            printf("[采集#%d] VI获取: %ld us, YUV拷贝: %ld us, 总计: %ld us\n", 
+                   frame_counter, vi_time_us, copy_time_us, total_time_us);
         }
 #endif
         
@@ -255,20 +288,122 @@ void Video::captureLoop() {
     printf("[采集线程] 退出\n");
 }
 
-// ============ 线程2: 推理循环 ============
-void Video::inferenceLoop() {
-    cv::Mat yuv_mat, bgr_mat;
-    int sX, sY, eX, eY;
+// ============ 线程2: BGR转换循环 ============
+// 功能: 从capture_buffer获取YUV，转换为BGR，同时输出给编码和推理线程
+// 性能: YUV→BGR 32ms（RV1106无GPU硬件限制，瓶颈） + 指针轮换<1us + 推理拷贝10ms
+// 特点: 转换在write缓冲区完成（无锁），轮换时仅交换指针（极快），每N帧拷贝给推理
+void Video::bgrConvertLoop() {
     int yuv_size = width_ * height_ * 3 / 2;
     unsigned char* yuv_buffer = (unsigned char*)malloc(yuv_size);
+    cv::Mat yuv_mat;
+    int frame_counter = 0;
     
 #ifdef ENABLE_PERFORMANCE_TIMING
-    struct timeval t_start, t_end, t_total_start;
-    long cvt_time_us, letterbox_time_us, inference_time_us, total_time_us;
+    struct timeval t_start, t_end;
+    long cvt_time_us, swap_time_us, inference_copy_time_us = 0;
+#endif
+    
+    printf("[BGR转换线程] 启动 - 三缓冲指针轮换模式 + 推理BGR共享\n");
+    
+    while(running_) {
+        bool has_frame = false;
+        
+        // 🔒 从capture_buffer获取YUV数据（加锁保护）
+        pthread_mutex_lock(&capture_buffer_.mutex);
+        if (capture_buffer_.ready) {
+            memcpy(yuv_buffer, capture_buffer_.yuv_data, yuv_size);
+            has_frame = true;
+            capture_buffer_.ready = false;  // 标记已消费
+        }
+        pthread_mutex_unlock(&capture_buffer_.mutex);
+        
+        if (!has_frame) {
+            usleep(1000); // 1ms
+            continue;
+        }
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // YUV→BGR转换（无锁，直接写入write缓冲区，32ms为系统瓶颈）
+        yuv_mat = cv::Mat(height_ + height_ / 2, width_, CV_8UC1, yuv_buffer);
+        cv::cvtColor(yuv_mat, *bgr_buffer_.bgr_write, cv::COLOR_YUV420sp2BGR);
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        cvt_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // 🔒 三缓冲轮换：write→ready→read→write（加锁，仅轮换指针 <1us）
+        // 零拷贝技术：仅交换8字节指针，比拷贝2.7MB数据快数万倍
+        pthread_mutex_lock(&bgr_buffer_.mutex);
+        cv::Mat* temp = bgr_buffer_.bgr_ready;  // 保存旧的ready
+        bgr_buffer_.bgr_ready = bgr_buffer_.bgr_write;  // write提升为ready
+        bgr_buffer_.bgr_write = temp;  // 旧ready降为write
+        bgr_buffer_.timestamp = TEST_COMM_GetNowUs();
+        bgr_buffer_.frame_index = frame_counter;
+        bgr_buffer_.ready = true;
+        pthread_mutex_unlock(&bgr_buffer_.mutex);
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        swap_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+#endif
+        
+        // 🔒 每N帧拷贝BGR数据给推理线程（跳帧策略，深拷贝避免冲突）
+        // 注意：使用深拷贝而非指针共享，避免与编码线程冲突（编码会修改bgr_read）
+        if (ai_enable_ && (frame_counter % (inference_frame_skip_ + 1)) == 0) {
+#ifdef ENABLE_PERFORMANCE_TIMING
+            gettimeofday(&t_start, NULL);
+#endif
+            pthread_mutex_lock(&inference_bgr_buffer_.mutex);
+            if (!inference_bgr_buffer_.ready) {  // 避免覆盖未处理的帧
+                bgr_buffer_.bgr_ready->copyTo(inference_bgr_buffer_.bgr_data);
+                inference_bgr_buffer_.frame_index = frame_counter;
+                inference_bgr_buffer_.ready = true;
+            }
+            pthread_mutex_unlock(&inference_bgr_buffer_.mutex);
+            
+#ifdef ENABLE_PERFORMANCE_TIMING
+            gettimeofday(&t_end, NULL);
+            inference_copy_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+#endif
+        } else {
+            inference_copy_time_us = 0;
+        }
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        if (frame_counter % 30 == 0) {
+            long total_us = cvt_time_us + swap_time_us + inference_copy_time_us;
+            printf("[BGR转换#%d] YUV→BGR: %ld us, 指针轮换: %ld us, 推理拷贝: %ld us, 总计: %ld us\n", 
+                   frame_counter, cvt_time_us, swap_time_us, inference_copy_time_us, total_us);
+        }
+#endif
+        
+        frame_counter++;
+    }
+    
+    free(yuv_buffer);
+    printf("[BGR转换线程] 退出\n");
+}
+
+// ============ 线程3: 推理循环 ============
+// 功能: 从inference_bgr_buffer获取BGR数据，letterbox缩放，RKNN推理
+// 性能: letterbox 18ms + 推理 96ms = 114ms（每3帧推理1次，节省68ms BGR转换）
+// 特点: 独立运行，不影响编码线程，结果通过detection_mutex_共享
+void Video::inferenceLoop() {
+    cv::Mat bgr_mat;
+    int sX, sY, eX, eY;
+    
+#ifdef ENABLE_PERFORMANCE_TIMING
+    struct timeval t_start, t_end;
+    long letterbox_time_us, inference_time_us, total_time_us;
     int inference_counter = 0;
 #endif
     
-    printf("[推理线程] 启动\n");
+    printf("[推理线程] 启动 - 直接使用BGR数据模式（节省68ms BGR转换）\n");
     
     while(running_) {
         if (!ai_enable_) {
@@ -276,34 +411,22 @@ void Video::inferenceLoop() {
             continue;
         }
         
-        // 获取待推理帧
+        // 🔒 获取待推理BGR帧（加锁保护，每3帧推理1次）
         bool has_frame = false;
-        pthread_mutex_lock(&inference_buffer_.mutex);
-        if (inference_buffer_.ready) {
-            memcpy(yuv_buffer, inference_buffer_.yuv_data, yuv_size);
-            inference_buffer_.ready = false;
+        pthread_mutex_lock(&inference_bgr_buffer_.mutex);
+        if (inference_bgr_buffer_.ready) {
+            bgr_mat = inference_bgr_buffer_.bgr_data.clone();  // 深拷贝避免竞争
+            inference_bgr_buffer_.ready = false;
             has_frame = true;
         }
-        pthread_mutex_unlock(&inference_buffer_.mutex);
+        pthread_mutex_unlock(&inference_bgr_buffer_.mutex);
         
         if (!has_frame) {
-            usleep(10000); // 增加到10ms，减少CPU空转
+            usleep(10000); // 10ms
             continue;
         }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
-        gettimeofday(&t_total_start, NULL);
-        gettimeofday(&t_start, NULL);
-#endif
-        
-        // YUV转BGR（仅用于推理）
-        yuv_mat = cv::Mat(height_ + height_ / 2, width_, CV_8UC1, yuv_buffer);
-        bgr_mat = cv::Mat(height_, width_, CV_8UC3);
-        cv::cvtColor(yuv_mat, bgr_mat, cv::COLOR_YUV420sp2BGR);
-        
-#ifdef ENABLE_PERFORMANCE_TIMING
-        gettimeofday(&t_end, NULL);
-        cvt_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
         gettimeofday(&t_start, NULL);
 #endif
         
@@ -323,14 +446,12 @@ void Video::inferenceLoop() {
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
         inference_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
-        gettimeofday(&t_total_start, NULL);
-        total_time_us = (t_total_start.tv_sec - t_total_start.tv_sec) * 1000000 + (t_total_start.tv_usec - t_total_start.tv_usec);
-        total_time_us = cvt_time_us + letterbox_time_us + inference_time_us;
+        total_time_us = letterbox_time_us + inference_time_us;
         
         inference_counter++;
         if (inference_counter % 10 == 0) {
-            printf("[推理] YUV转BGR: %ld us, letterbox: %ld us, RKNN推理: %ld us, 总计: %ld us\n", 
-                   cvt_time_us, letterbox_time_us, inference_time_us, total_time_us);
+            printf("[推理#%d] letterbox: %ld us, RKNN推理: %ld us, 总计: %ld us (节省YUV→BGR 68ms)\n", 
+                   inference_counter, letterbox_time_us, inference_time_us, total_time_us);
         }
 #endif
         
@@ -379,8 +500,8 @@ void Video::inferenceLoop() {
             }
             
             if (drawBox) {
-                printf("%s @ (%d %d %d %d) %.3f\n", 
-                       coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
+                // printf("%s @ (%d %d %d %d) %.3f\n", 
+                //        coco_cls_to_name(det_result->cls_id), sX, sY, eX, eY, det_result->prop);
                 
                 DetectionInfo detection;
                 detection.cls_id = det_result->cls_id;
@@ -394,7 +515,7 @@ void Video::inferenceLoop() {
             }
         }
         
-        // 更新共享检测结果
+        // 🔒 更新共享检测结果（加锁保护）
         pthread_mutex_lock(&detection_mutex_);
         shared_detections_.clear();
         shared_detections_.assign(temp_detections.begin(), temp_detections.end());
@@ -408,74 +529,85 @@ void Video::inferenceLoop() {
                 current_detections_ = temp_detections;
                 std::string summary = buildDetectionSummary();
                 control_->onDetectionSummary(summary);
-                printf("发送检测结果汇总 (包含%zu个物体)\n", temp_detections.size());
+                // printf("发送检测结果汇总 (包含%zu个物体)\n", temp_detections.size());
                 last_time = now;
             }
         }
     }
     
-    free(yuv_buffer);
     printf("[推理线程] 退出\n");
 }
 
-// ============ 线程3: 编码推流循环 ============
+// ============ 线程4: 编码推流循环 ============
+// 功能: 从BGR三缓冲区获取ready帧，绘制检测框+FPS，H.264编码，RTSP推流
+// 性能: 指针交换<1us + 绘制2ms + H.264编码12ms + RTSP 1ms = 15ms
+// 特点: 受限于BGR转换速度(37ms)，实际输出27fps，FPS在此线程统计
 void Video::encodeLoop() {
     RK_S32 s32Ret;
-    cv::Mat yuv_mat, bgr_mat;
-    int yuv_size = width_ * height_ * 3 / 2;
-    unsigned char* yuv_buffer = (unsigned char*)malloc(yuv_size);
     std::vector<DetectionInfo> local_detections;
+    int last_processed_index = -1;  // 上次处理的帧序号（避免重复）
     
     // FPS统计
     frame_count_ = 0;
-    fps_start_time_ = time(NULL);
+    gettimeofday(&fps_start_time_, NULL);
+    gettimeofday(&program_start_time_, NULL);  // 记录程序启动时间
     current_fps_ = 0.0f;
     
 #ifdef ENABLE_PERFORMANCE_TIMING
-    struct timeval t_start, t_end, t_total_start;
-    long cvt_time_us, draw_time_us, encode_time_us, rtsp_time_us, total_time_us;
+    struct timeval t_start, t_end;
+    long swap_time_us, draw_time_us, encode_time_us, rtsp_time_us, total_time_us;
     int encode_counter = 0;
 #endif
     
-    printf("[编码线程] 启动\n");
+    printf("[编码线程] 启动 - 三缓冲模式，从BGR转换线程获取\n");
     
     while(running_) {
-        // 获取采集帧
+        // 🔒 从BGR缓冲区交换ready→read指针（加锁保护，允许跳帧）
+        // 三缓冲优势：编码线程使用read缓冲期间，BGR转换可同时写write缓冲
         bool has_frame = false;
         uint64_t timestamp;
-        
-        pthread_mutex_lock(&capture_buffer_.mutex);
-        if (capture_buffer_.ready) {
-            memcpy(yuv_buffer, capture_buffer_.yuv_data, yuv_size);
-            timestamp = capture_buffer_.timestamp;
-            capture_buffer_.ready = false;
-            has_frame = true;
-        }
-        pthread_mutex_unlock(&capture_buffer_.mutex);
-        
-        if (!has_frame) {
-            usleep(1000); // 减少到1ms，更快响应
-            continue;
-        }
+        int current_frame_index;
         
 #ifdef ENABLE_PERFORMANCE_TIMING
-        gettimeofday(&t_total_start, NULL);
         gettimeofday(&t_start, NULL);
 #endif
         
-        // YUV转BGR（用于绘制）
-        yuv_mat = cv::Mat(height_ + height_ / 2, width_, CV_8UC1, yuv_buffer);
-        bgr_mat = cv::Mat(height_, width_, CV_8UC3, data_);
-        cv::cvtColor(yuv_mat, bgr_mat, cv::COLOR_YUV420sp2BGR);
-        cv::resize(bgr_mat, frame_, cv::Size(width_, height_), 0, 0, cv::INTER_LINEAR);
+        pthread_mutex_lock(&bgr_buffer_.mutex);
+        if (bgr_buffer_.ready) {
+            // 交换ready和read指针（无论是否处理过，都交换以获取最新帧）
+            cv::Mat* temp = bgr_buffer_.bgr_read;
+            bgr_buffer_.bgr_read = bgr_buffer_.bgr_ready;
+            bgr_buffer_.bgr_ready = temp;
+            
+            timestamp = bgr_buffer_.timestamp;
+            current_frame_index = bgr_buffer_.frame_index;
+            bgr_buffer_.ready = false;  // 标记已消费
+            has_frame = true;
+            last_processed_index = current_frame_index;  // 更新已处理帧序号
+        }
+        pthread_mutex_unlock(&bgr_buffer_.mutex);
         
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
-        cvt_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
+        swap_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
         gettimeofday(&t_start, NULL);
 #endif
         
-        // 获取最新检测结果
+        if (!has_frame) {
+            usleep(1000); // 1ms
+            continue;
+        }
+        
+        // 使用read缓冲区的BGR数据（浅拷贝，共享数据指针，无性能损失）
+        frame_ = *bgr_buffer_.bgr_read;
+        
+#ifdef ENABLE_PERFORMANCE_TIMING
+        gettimeofday(&t_end, NULL);
+        // swap_time已包含在上面，这里不额外计时
+        gettimeofday(&t_start, NULL);
+#endif
+        
+        // 🔒 获取最新检测结果（加锁保护）
         pthread_mutex_lock(&detection_mutex_);
         local_detections.clear();
         local_detections.assign(shared_detections_.begin(), shared_detections_.end());
@@ -511,21 +643,44 @@ void Video::encodeLoop() {
                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
         }
         
-        // 绘制FPS
+        // ✅ 精确FPS计算（使用微秒级时间）
         frame_count_++;
-        time_t current_time = time(NULL);
-        if (current_time - fps_start_time_ >= 1) {
-            current_fps_ = (float)frame_count_;
+        struct timeval current_time;
+        gettimeofday(&current_time, NULL);
+        
+        // 计算距离上次FPS更新的时间差（秒）
+        double time_diff = (current_time.tv_sec - fps_start_time_.tv_sec) + 
+                          (current_time.tv_usec - fps_start_time_.tv_usec) / 1000000.0;
+        
+        if (time_diff >= 1.0) {
+            current_fps_ = (float)frame_count_ / time_diff;  // 精确FPS
+            printf("[FPS统计] 实际处理帧数: %d, 时间差: %.3f秒, FPS: %.1f\n", 
+                   frame_count_, time_diff, current_fps_);
             frame_count_ = 0;
             fps_start_time_ = current_time;
         }
         
+        // 计算运行时间（分:秒.毫秒）
+        double runtime = (current_time.tv_sec - program_start_time_.tv_sec) + 
+                        (current_time.tv_usec - program_start_time_.tv_usec) / 1000000.0;
+        int minutes = (int)(runtime / 60);
+        int seconds = (int)runtime % 60;
+        int milliseconds = (int)((runtime - (int)runtime) * 1000);
+        
+        // 绘制FPS和运行时间
         if (current_fps_ > 0.0f) {
-            char fps_text[16];
-            sprintf(fps_text, "%.0f", current_fps_);
+            char fps_text[32];
+            sprintf(fps_text, "%.1f", current_fps_);  // 显示1位小数
             cv::putText(frame_, fps_text, 
-                       cv::Point(width_ - 50, height_ / 4), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1); // 字体和线宽减小
+                       cv::Point(width_ - 60, height_ / 4), 
+                       cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+            
+            // 在FPS下方显示运行时间
+            char time_text[32];
+            sprintf(time_text, "%02d:%02d.%03d", minutes, seconds, milliseconds);
+            cv::putText(frame_, time_text, 
+                       cv::Point(width_ - 90, height_ / 4 + 25), 
+                       cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 255), 1);
         }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -559,23 +714,23 @@ void Video::encodeLoop() {
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
         rtsp_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
-        total_time_us = cvt_time_us + draw_time_us + encode_time_us + rtsp_time_us;
+        total_time_us = swap_time_us + draw_time_us + encode_time_us + rtsp_time_us;
         
         encode_counter++;
         if (encode_counter % 30 == 0) {
-            printf("[编码] YUV转BGR: %ld us, 绘制: %ld us, H.264编码: %ld us, RTSP推流: %ld us, 总计: %ld us\n", 
-                   cvt_time_us, draw_time_us, encode_time_us, rtsp_time_us, total_time_us);
+            printf("[编码#%d] 指针交换: %ld us, 绘制: %ld us, H.264: %ld us, RTSP: %ld us, 总计: %ld us\n", 
+                   encode_counter, swap_time_us, draw_time_us, encode_time_us, rtsp_time_us, total_time_us);
         }
 #endif
         
         RK_MPI_VENC_ReleaseStream(0, &stFrame_);
     }
     
-    free(yuv_buffer);
     printf("[编码线程] 退出\n");
 }
 
 // letterbox处理：缩放+填充，适配模型输入
+// 优化：使用INTER_NEAREST插值（比INTER_LINEAR快2-5倍）+ memset填充黑边
 cv::Mat Video::letterbox(cv::Mat input) {
     float scaleX = (float)model_width_ / (float)width_;
     float scaleY = (float)model_height_ / (float)height_;
@@ -585,8 +740,9 @@ cv::Mat Video::letterbox(cv::Mat input) {
     leftPadding_ = (model_width_ - inputWidth) / 2;
     topPadding_ = (model_height_ - inputHeight) / 2;
     cv::Mat inputScale;
-    cv::resize(input, inputScale, cv::Size(inputWidth,inputHeight), 0, 0, cv::INTER_LINEAR);
-    cv::Mat letterboxImage(model_width_, model_height_, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::resize(input, inputScale, cv::Size(inputWidth,inputHeight), 0, 0, cv::INTER_NEAREST);
+    cv::Mat letterboxImage(model_height_, model_width_, CV_8UC3);
+    memset(letterboxImage.data, 0, model_width_ * model_height_ * 3);
     cv::Rect roi(leftPadding_, topPadding_, inputWidth, inputHeight);
     inputScale.copyTo(letterboxImage(roi));
     return letterboxImage;
