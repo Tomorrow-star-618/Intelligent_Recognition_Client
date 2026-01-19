@@ -3,6 +3,7 @@
 // 性能：RV1106硬件限制，BGR转换37ms为瓶颈，系统稳定27fps
 #include "video.h"
 #include "control.h"
+#include "../onvif/onvif_server.h"  // ONVIF服务器头文件
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -10,6 +11,10 @@
 #include <time.h>
 #include <sstream>
 #include <iomanip>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <arpa/inet.h>
 
 
 // 构造函数，初始化参数和三级缓冲区
@@ -18,14 +23,21 @@ Video::Video(int width, int height, int model_width, int model_height)
       H264_TimeRef_(0), g_rtsplive_(NULL), g_rtsp_session_(NULL), running_(false), 
       ai_enable_(false), area_enable_(false), obj_enable_(false), 
       control_(nullptr), last_send_time_(0), send_interval_(DEFAULT_SEND_INTERVAL),
+#if defined(ENABLE_FPS_CONSOLE) || defined(ENABLE_FPS_DISPLAY)
       frame_count_(0), current_fps_(0.0f),
+#endif
       thread_capture_(0), thread_bgr_convert_(0), thread_inference_(0), thread_encode_(0),
       inference_frame_skip_(INFERENCE_FRAME_SKIP),  // 使用宏定义的跳帧参数
-      has_detection_result_(false) {  // 初始化检测结果标志
+      has_detection_result_(false),  // 初始化检测结果标志
+      onvif_server_(nullptr) {  // 初始化ONVIF服务器指针
     
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
+#if defined(ENABLE_FPS_CONSOLE) || defined(ENABLE_FPS_DISPLAY)
     memset(&fps_start_time_, 0, sizeof(struct timeval));
+#endif
+#ifdef ENABLE_FPS_DISPLAY
     memset(&program_start_time_, 0, sizeof(struct timeval));
+#endif
     
     // 初始化YUV缓冲区（采集 → BGR转换）
     int yuv_size = width_ * height_ * 3 / 2;
@@ -58,6 +70,9 @@ Video::Video(int width, int height, int model_width, int model_height)
 // 析构函数，自动释放资源
 Video::~Video() {
     stop();
+    
+    // 停止ONVIF服务
+    stopOnvif();
     
     pthread_mutex_destroy(&capture_buffer_.mutex);
     pthread_mutex_destroy(&inference_bgr_buffer_.mutex);
@@ -215,6 +230,85 @@ void Video::stop() {
     RK_MPI_SYS_Exit();
     release_yolov5_model(&rknn_app_ctx_);
     deinit_post_process();
+}
+
+// ============ 暂停/恢复所有线程 ============
+
+// 暂停所有线程（设置running_=false，线程会在下次循环时退出）
+void Video::pauseAllThreads() {
+    if (!running_) {
+        printf("[Video] ⚠️ 视频系统已处于停止状态\n");
+        return;
+    }
+    
+    printf("[Video] ⏸️  暂停所有线程...\n");
+    running_ = false;
+    
+    // 等待所有线程退出
+    if (thread_capture_) {
+        pthread_join(thread_capture_, NULL);
+        thread_capture_ = 0;
+        printf("[Video]    ✅ 采集线程已暂停\n");
+    }
+    if (thread_bgr_convert_) {
+        pthread_join(thread_bgr_convert_, NULL);
+        thread_bgr_convert_ = 0;
+        printf("[Video]    ✅ BGR转换线程已暂停\n");
+    }
+    if (thread_inference_) {
+        pthread_join(thread_inference_, NULL);
+        thread_inference_ = 0;
+        printf("[Video]    ✅ 推理线程已暂停\n");
+    }
+    if (thread_encode_) {
+        pthread_join(thread_encode_, NULL);
+        thread_encode_ = 0;
+        printf("[Video]    ✅ 编码推流线程已暂停\n");
+    }
+    
+    printf("[Video] ✅ 所有线程已暂停（硬件资源保持激活状态）\n");
+}
+
+// 恢复所有线程（重新启动4个线程）
+void Video::resumeAllThreads() {
+    if (running_) {
+        printf("[Video] ⚠️ 视频系统已在运行中\n");
+        return;
+    }
+    
+    printf("[Video] ▶️  恢复所有线程...\n");
+    running_ = true;
+    
+    // 重启4个线程
+    if (pthread_create(&thread_capture_, NULL, captureThreadFunc, this) != 0) {
+        printf("[Video] ❌ 采集线程创建失败\n");
+        running_ = false;
+        return;
+    }
+    printf("[Video]    ✅ 采集线程已启动\n");
+    
+    if (pthread_create(&thread_bgr_convert_, NULL, bgrConvertThreadFunc, this) != 0) {
+        printf("[Video] ❌ BGR转换线程创建失败\n");
+        running_ = false;
+        return;
+    }
+    printf("[Video]    ✅ BGR转换线程已启动\n");
+    
+    if (pthread_create(&thread_inference_, NULL, inferenceThreadFunc, this) != 0) {
+        printf("[Video] ❌ 推理线程创建失败\n");
+        running_ = false;
+        return;
+    }
+    printf("[Video]    ✅ 推理线程已启动\n");
+    
+    if (pthread_create(&thread_encode_, NULL, encodeThreadFunc, this) != 0) {
+        printf("[Video] ❌ 编码推流线程创建失败\n");
+        running_ = false;
+        return;
+    }
+    printf("[Video]    ✅ 编码推流线程已启动\n");
+    
+    printf("[Video] ✅ 所有线程已恢复运行\n");
 }
 
 // ============ 线程入口函数 ============
@@ -391,9 +485,9 @@ void Video::bgrConvertLoop() {
 #ifdef ENABLE_PERFORMANCE_TIMING
             gettimeofday(&t_end, NULL);
             inference_copy_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
-#endif
         } else {
             inference_copy_time_us = 0;
+#endif
         }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -582,11 +676,15 @@ void Video::encodeLoop() {
     RK_S32 s32Ret;
     int last_processed_index = -1;  // 上次处理的帧序号（避免重复）
     
-    // FPS统计
+    // FPS统计初始化
+#if defined(ENABLE_FPS_CONSOLE) || defined(ENABLE_FPS_DISPLAY)
     frame_count_ = 0;
     gettimeofday(&fps_start_time_, NULL);
-    gettimeofday(&program_start_time_, NULL);  // 记录程序启动时间
     current_fps_ = 0.0f;
+#endif
+#ifdef ENABLE_FPS_DISPLAY
+    gettimeofday(&program_start_time_, NULL);  // 记录程序启动时间
+#endif
     
 #ifdef ENABLE_PERFORMANCE_TIMING
     struct timeval t_start, t_end;
@@ -682,6 +780,7 @@ void Video::encodeLoop() {
                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
         }
         
+#if defined(ENABLE_FPS_CONSOLE) || defined(ENABLE_FPS_DISPLAY)
         // ✅ 精确FPS计算（使用微秒级时间）
         frame_count_++;
         struct timeval current_time;
@@ -693,12 +792,15 @@ void Video::encodeLoop() {
         
         if (time_diff >= 1.0) {
             current_fps_ = (float)frame_count_ / time_diff;  // 精确FPS
+#ifdef ENABLE_FPS_CONSOLE
             printf("[FPS统计] 实际处理帧数: %d, 时间差: %.3f秒, FPS: %.1f\n", 
                    frame_count_, time_diff, current_fps_);
+#endif
             frame_count_ = 0;
             fps_start_time_ = current_time;
         }
-        
+
+#ifdef ENABLE_FPS_DISPLAY
         // 计算运行时间（分:秒.毫秒）
         double runtime = (current_time.tv_sec - program_start_time_.tv_sec) + 
                         (current_time.tv_usec - program_start_time_.tv_usec) / 1000000.0;
@@ -721,6 +823,8 @@ void Video::encodeLoop() {
                        cv::Point(width_ - 90, height_ / 4 + 25), 
                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 255), 1);
         }
+#endif
+#endif
         
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
@@ -830,12 +934,6 @@ void Video::startObjectDetect() {
 void Video::stopObjectDetect() {
     obj_enable_ = false;
 }
-void Video::startRTSP() {
-    rtsp_enable_ = true;   
-}
-void Video::stopRTSP() {
-    rtsp_enable_ = false;
-}
 
 void Video::setControl(Control* control) {
     control_ = control;
@@ -870,3 +968,82 @@ std::string Video::buildDetectionSummary() {
     
     return oss.str();
 }
+
+// ============ ONVIF协议支持 ============
+
+// 启动ONVIF服务
+bool Video::startOnvif(int port) {
+    if (onvif_server_) {
+        printf("[Video] ONVIF服务已在运行\n");
+        return false;
+    }
+    
+    // 创建ONVIF服务器对象
+    onvif_server_ = new OnvifServer(this, port);
+    
+    // 设置设备信息
+    onvif_server_->setDeviceInfo(
+        "SmartCamera",           // 制造商
+        "RV1106-AI-Camera",      // 型号
+        "1.0.0",                 // 固件版本
+        "RV1106-20241216001"     // 序列号
+    );
+    
+    // 设置RTSP流地址
+    onvif_server_->setRtspUrl(getRtspUrl());
+    
+    // 启动ONVIF服务
+    if (!onvif_server_->start()) {
+        delete onvif_server_;
+        onvif_server_ = nullptr;
+        printf("[Video] ❌ ONVIF服务启动失败\n");
+        return false;
+    }
+    
+    printf("[Video] ✅ ONVIF服务启动成功，端口: %d\n", port);
+    return true;
+}
+
+// 停止ONVIF服务
+void Video::stopOnvif() {
+    if (onvif_server_) {
+        onvif_server_->stop();
+        delete onvif_server_;
+        onvif_server_ = nullptr;
+        printf("[Video] ONVIF服务已停止\n");
+    }
+}
+
+// 获取RTSP流地址
+std::string Video::getRtspUrl() const {
+    // 动态获取本机IP地址
+    std::string local_ip = "192.168.1.100";  // 默认IP
+    
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock >= 0) {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        
+        // 尝试eth0网卡
+        strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+        if (ioctl(sock, SIOCGIFADDR, &ifr) >= 0) {
+            struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
+            local_ip = std::string(inet_ntoa(addr->sin_addr));
+        } else {
+            // 尝试wlan0网卡
+            strncpy(ifr.ifr_name, "wlan0", IFNAMSIZ - 1);
+            if (ioctl(sock, SIOCGIFADDR, &ifr) >= 0) {
+                struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
+                local_ip = std::string(inet_ntoa(addr->sin_addr));
+            }
+        }
+        close(sock);
+    }
+    
+    // 构建RTSP地址：rtsp://IP:554/live/0
+    char rtsp_url[256];
+    snprintf(rtsp_url, sizeof(rtsp_url), "rtsp://%s:554/live/0", local_ip.c_str());
+    
+    return std::string(rtsp_url);
+}
+

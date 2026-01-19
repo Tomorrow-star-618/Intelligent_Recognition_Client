@@ -44,14 +44,10 @@ bool TcpClient::init() {
     return true;
 }
 
-// 启动TCP线程，线程内循环心跳和接收
+// 启动TCP线程，线程内循环心跳和接收（支持自动重连）
 bool TcpClient::start() {
-    // 自动重连，直到连接成功
-    while (!init()) {
-        printf("TCP连接失败，5秒后重试...\n");
-        sleep(5);
-    }
     running_ = true;
+    // 不阻塞主流程，线程内部会自动尝试连接
     return pthread_create(&thread_, NULL, threadFunc, this) == 0;
 }
 
@@ -106,10 +102,24 @@ void* TcpClient::threadFunc(void* arg) {
     return nullptr;
 }
 
-// 线程主循环：接收服务器数据
+// 线程主循环：自动重连 + 接收服务器数据
 void TcpClient::run() {
     char buf[128];
-    while (running_ && connected_) {
+    
+    while (running_) {
+        // 如果未连接，尝试连接
+        if (!connected_) {
+            printf("TCP尝试连接到 %s:%d...\n", ip_.c_str(), port_);
+            if (init()) {
+                printf("✅ TCP连接成功！\n");
+            } else {
+                printf("❌ TCP连接失败，5秒后重试...\n");
+                sleep(5);
+                continue;
+            }
+        }
+        
+        // 接收数据
         ssize_t n = recv(sockfd_, buf, sizeof(buf)-1, MSG_DONTWAIT);
         if (n > 0) {
             buf[n] = '\0';
@@ -128,12 +138,17 @@ void TcpClient::run() {
                 printf("Warning: Control对象未设置，无法处理接收到的数据\n");
             }
         } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-            printf("TCP连接断开，线程退出，等待主流程重连...\n");
+            printf("TCP连接断开，5秒后自动重连...\n");
             connected_ = false;
-            close(sockfd_);
-            sockfd_ = -1;
-            break;
+            if (sockfd_ >= 0) {
+                close(sockfd_);
+                sockfd_ = -1;
+            }
+            sleep(5);
+            continue;
         }
         usleep(10000);
     }
+    
+    printf("TCP线程退出\n");
 }

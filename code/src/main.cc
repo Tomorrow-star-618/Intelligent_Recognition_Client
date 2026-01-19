@@ -38,29 +38,32 @@ int main(int argc, char *argv[])
     Servo* g_servo = new Servo();
     printf("云台初始化成功\n");
 
-	// 初始化并启动TCP客户端
-    printf("开始tcp初始化！\n");
-    TcpClient* g_tcp = new TcpClient("192.168.1.156", 8890);
-    if (g_tcp->init()) {
-        printf("TCP客户端初始化成功！\n");
-    } else {
-        printf("TCP客户端初始化失败！\n");
-    }
-
-	// 启动TCP线程（由start内部自动重连并启动）
-    g_tcp->start();
-    printf("TCP线程已自动启动\n");
-
-    // 初始化并启动视频处理模块
+    // 初始化并启动视频处理模块（不依赖TCP，优先启动）
     printf("开始视频初始化！\n");
     Video* g_video = new Video(width, height, model_width, model_height);
     if (g_video->init()) {
         printf("视频模块初始化成功！\n");
         g_video->start();
         printf("视频线程已自动启动\n");
+        
+        // ✅ 启动ONVIF服务（端口8080）
+        printf("开始启动ONVIF服务...\n");
+        if (g_video->startOnvif(8080)) {
+            printf("✅ ONVIF服务启动成功！\n");
+            printf("   - 设备发现地址: http://设备IP:8080/onvif/device_service\n");
+            printf("   - 客户端可通过ONVIF协议发现并获取RTSP流地址\n");
+        } else {
+            printf("❌ ONVIF服务启动失败（不影响RTSP推流）\n");
+        }
     } else {
         printf("视频模块初始化失败！\n");
     }
+
+    // 初始化TCP客户端（后台自动重连，不阻塞）
+    printf("开始TCP初始化（后台自动重连）...\n");
+    TcpClient* g_tcp = new TcpClient("192.168.1.201", 8890);
+    g_tcp->start();  // 启动TCP线程（内部会自动重连）
+    printf("TCP线程已启动（将在后台自动尝试连接）\n");
 
     // 实例化Control对象，传入所有需要的指针
     Control* g_control = new Control(g_servo, g_video, g_tcp);
@@ -74,19 +77,39 @@ int main(int argc, char *argv[])
     g_video->setControl(g_control);
     printf("Video-Control关联已建立\n");
 
-    char cmd[64];
-    printf("请输入命令（quit）：\n");
+    char cmd[128];
+    printf("\n===========================================\n");
+    printf("系统就绪！支持本地命令输入（格式与TCP相同）\n");
+    printf("命令示例：\n");
+    printf("  DEVICE_1:OP_1:VALUE_90    - 云台控制\n");
+    printf("  DEVICE_2:OP_6:VALUE_1     - 启动AI识别\n");
+    printf("  DEVICE_2:OP_9:VALUE_0     - 暂停视频流\n");
+    printf("  RECT:100,100,200,150      - 设置检测区域\n");
+    printf("  LIST:0,1,2                - 设置检测对象\n");
+    printf("  quit                      - 退出程序\n");
+    printf("===========================================\n");
+    
     while (!quit)
     {
         printf("> ");
         fflush(stdout);
         if (fgets(cmd, sizeof(cmd), stdin) == NULL) break;
+        
         // 去除换行符
         cmd[strcspn(cmd, "\r\n")] = 0;
+        
         if (strcmp(cmd, "quit") == 0) {
             quit = true;
-        } else {
-            printf("未知命令: %s\n", cmd);
+        } else if (strlen(cmd) > 0) {
+            // 处理本地命令（格式与TCP相同）
+            printf("本地命令: %s\n", cmd);
+            if (strncmp(cmd, "RECT:", 5) == 0) {
+                g_control->parseRectInfo(std::string(cmd));
+            } else if (strncmp(cmd, "LIST:", 5) == 0) {
+                g_control->parseObjList(std::string(cmd));
+            } else {
+                g_control->parseAndDispatch(std::string(cmd));
+            }
         }
     }
 	// 等待视频线程和TCP线程结束

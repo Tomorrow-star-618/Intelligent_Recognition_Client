@@ -41,6 +41,7 @@ file(GLOB SRC_SERVO "${EXAMPLE_DIR}/modules/servo/*.cc")
 file(GLOB SRC_TCP "${EXAMPLE_DIR}/modules/tcp/*.cc")
 file(GLOB SRC_VIDEO "${EXAMPLE_DIR}/modules/video/*.cc")
 file(GLOB SRC_YOLO "${EXAMPLE_DIR}/modules/yolo/*.cc")
+file(GLOB SRC_ONVIF "${EXAMPLE_DIR}/modules/onvif/*.cc")  # ONVIF模块
 file(GLOB SRC_MAIN "${EXAMPLE_DIR}/src/*.cc")
 
 set(SRC_FILES
@@ -49,6 +50,7 @@ set(SRC_FILES
     ${SRC_TCP}
     ${SRC_VIDEO}
     ${SRC_YOLO}
+    ${SRC_ONVIF}  # 添加ONVIF源文件
     ${SRC_MAIN}
 )
 add_executable(${PROJECT_NAME} ${SRC_FILES})
@@ -87,6 +89,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
                             ${EXAMPLE_DIR}/modules/tcp
                             ${EXAMPLE_DIR}/modules/video
                             ${EXAMPLE_DIR}/modules/yolo
+                            ${EXAMPLE_DIR}/modules/onvif  # ONVIF模块头文件
                             ${CMAKE_CURRENT_SOURCE_DIR}
                             ${CMAKE_CURRENT_SOURCE_DIR}/utils
                             ${CMAKE_CURRENT_SOURCE_DIR}/common 

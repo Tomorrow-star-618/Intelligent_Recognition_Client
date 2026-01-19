@@ -5,7 +5,12 @@
 #define VIDEO_H
 
 // 性能计时开关：定义此宏以启用各线程处理时间统计（用于性能调优）
-#define ENABLE_PERFORMANCE_TIMING
+// #define ENABLE_PERFORMANCE_TIMING  // ❌ 已关闭性能计时（减少日志输出）
+
+// 帧率统计开关：分别控制终端输出和画面显示
+// #define ENABLE_FPS_CONSOLE  // ❌ 已关闭FPS终端日志输出
+#define ENABLE_FPS_DISPLAY  // ❌ 已关闭FPS画面显示（右上角FPS和运行时间）
+
 
 // 图像分辨率配置宏（用于采集和编码）
 #define IMAGE_WIDTH  1024    // 采集图像宽度
@@ -36,6 +41,7 @@
 
 // 前向声明
 class Control;
+class OnvifServer;  // ONVIF服务器前向声明
 
 // Video类：封装视频采集、推理、编码、推流等功能，支持独立线程运行
 class Video {
@@ -51,6 +57,15 @@ public:
     bool start();
     // 停止主循环线程并清理资源
     void stop();
+    
+    // ✅ 视频流控制（暂停/恢复所有线程）
+    // 暂停所有线程（采集、BGR转换、推理、编码推流）
+    void pauseAllThreads();
+    // 恢复所有线程
+    void resumeAllThreads();
+    // 检查是否正在运行
+    bool isRunning() const { return running_; }
+    
     // 开启AI识别
     void startAI();
     // 关闭AI识别
@@ -63,10 +78,6 @@ public:
     void startObjectDetect();
     // 关闭对象识别
     void stopObjectDetect();
-    // 开启RTSP推流
-    void startRTSP();
-    // 关闭RTSP推流
-    void stopRTSP();
     // 获取当前矩形框信息
     void getRectInfo(const RectInfo& info);
     // 获取对象列表
@@ -75,6 +86,14 @@ public:
     void setControl(Control* control);
     // 设置检测结果发送间隔（秒）
     void setSendInterval(int interval);
+    
+    // ✅ ONVIF协议支持
+    // 启动ONVIF服务（端口默认8080）
+    bool startOnvif(int port = 8080);
+    // 停止ONVIF服务
+    void stopOnvif();
+    // 获取RTSP流地址（供ONVIF调用）
+    std::string getRtspUrl() const;
          
 
 private:
@@ -138,11 +157,10 @@ private:
     pthread_t thread_bgr_convert_;   // BGR转换线程（YUV→BGR，37ms瓶颈）
     pthread_t thread_inference_;     // 推理线程（RKNN AI检测，每3帧）
     pthread_t thread_encode_;        // 编码推流线程（H.264+RTSP）
-    bool running_;
-    bool ai_enable_;      // AI识别开关标志
-    bool area_enable_;    // 区域识别开关标志
-    bool obj_enable_;     // 对象识别开关标志
-    bool rtsp_enable_;    // RTSP推流开关标志
+    bool running_;                   // 所有线程运行标志（控制暂停/恢复）
+    bool ai_enable_;                 // AI识别开关标志
+    bool area_enable_;               // 区域识别开关标志
+    bool obj_enable_;                // 对象识别开关标志
     
     // 线程间共享缓冲区（生产者-消费者模式，互斥锁保护）
     struct FrameBuffer {
@@ -203,10 +221,17 @@ private:
     std::vector<DetectionInfo> current_detections_;
     
     // 帧率计算相关（使用高精度时间，微秒级）
+#if defined(ENABLE_FPS_CONSOLE) || defined(ENABLE_FPS_DISPLAY)
     int frame_count_;              // 帧计数器
     struct timeval fps_start_time_;  // FPS计算开始时间（微秒精度）
-    struct timeval program_start_time_; // 程序启动时间（用于运行时间显示）
     float current_fps_;            // 当前FPS值（编码线程统计）
+#endif
+#ifdef ENABLE_FPS_DISPLAY
+    struct timeval program_start_time_; // 程序启动时间（用于运行时间显示）
+#endif
+    
+    // ✅ ONVIF服务器对象
+    OnvifServer* onvif_server_;    // ONVIF服务器指针
 };
 
 #endif // VIDEO_H

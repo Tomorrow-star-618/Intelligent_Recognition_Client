@@ -64,12 +64,13 @@ void Control::parseAndDispatch(const std::string& cmd) {
                     printf("未支持的operationValue: %d\n", operationValue);
                 }
             } else if (operationId == 9) {
+                // ✅ 暂停/恢复所有视频线程（完全控制）
                 if (operationValue == 1) {
-                    m_video->startRTSP();
-                    printf("RTSP推流已开启\n");
+                    m_video->resumeAllThreads();
+                    printf("✅ 所有视频线程已恢复（RTSP推流已开启）\n");
                 } else if (operationValue == 0) {
-                    m_video->stopRTSP();
-                    printf("RTSP推流已关闭\n");
+                    m_video->pauseAllThreads();
+                    printf("⏸️  所有视频线程已暂停（RTSP推流已关闭）\n");
                 } else {
                     printf("未支持的operationValue: %d\n", operationValue);
                 }
