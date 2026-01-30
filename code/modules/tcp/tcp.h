@@ -27,6 +27,13 @@ public:
     void setControl(Control* control);
     // 发送数据到服务器
     bool sendData(const std::string& data);
+    
+    // 动态更新服务器地址（用于UDP发现后更新）
+    // 如果当前已连接到其他服务器，会先断开再重连新地址
+    void updateServerAddress(const std::string& ip, int port = -1);
+    
+    // 获取当前服务器IP
+    std::string getServerIp() const { return ip_; }
 
 private:
     // 线程入口函数
@@ -41,6 +48,9 @@ private:
     bool running_;        // 线程运行标志
     bool connected_;      // 连接状态
     Control* control_;    // Control对象指针
+    
+    pthread_mutex_t mutex_;     // 互斥锁，保护IP更新
+    bool addressUpdated_;       // 地址是否已更新标志
 };
 
 #endif // TCP_H

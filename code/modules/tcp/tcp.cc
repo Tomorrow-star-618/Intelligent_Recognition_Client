@@ -9,11 +9,16 @@
 
 // 构造函数，初始化成员变量
 TcpClient::TcpClient(const std::string& ip, int port)
-    : ip_(ip), port_(port), sockfd_(-1), running_(false), connected_(false), control_(nullptr) {}
+    : ip_(ip), port_(port), sockfd_(-1), running_(false), connected_(false), 
+      control_(nullptr), addressUpdated_(false) 
+{
+    pthread_mutex_init(&mutex_, NULL);
+}
 
 // 析构函数，自动停止线程和关闭socket
 TcpClient::~TcpClient() {
     stop();
+    pthread_mutex_destroy(&mutex_);
 }
 
 // 初始化TCP连接（只建立连接，不启动线程）
@@ -95,6 +100,41 @@ bool TcpClient::sendData(const std::string& data) {
     return true;
 }
 
+// 动态更新服务器地址
+void TcpClient::updateServerAddress(const std::string& ip, int port) {
+    pthread_mutex_lock(&mutex_);
+    
+    // 检查是否真正有变化
+    bool changed = (ip_ != ip);
+    if (port > 0 && port != port_) {
+        changed = true;
+    }
+    
+    if (!changed) {
+        pthread_mutex_unlock(&mutex_);
+        return;
+    }
+    
+    printf("🔄 更新TCP服务器地址: %s:%d -> %s:%d\n", 
+           ip_.c_str(), port_, ip.c_str(), port > 0 ? port : port_);
+    
+    ip_ = ip;
+    if (port > 0) {
+        port_ = port;
+    }
+    addressUpdated_ = true;
+    
+    pthread_mutex_unlock(&mutex_);
+    
+    // 如果当前已连接，断开连接以便重连到新地址
+    if (connected_ && sockfd_ >= 0) {
+        printf("🔌 断开当前TCP连接，准备连接新地址...\n");
+        close(sockfd_);
+        sockfd_ = -1;
+        connected_ = false;
+    }
+}
+
 // 线程入口函数，调用run()
 void* TcpClient::threadFunc(void* arg) {
     TcpClient* self = static_cast<TcpClient*>(arg);
@@ -107,9 +147,34 @@ void TcpClient::run() {
     char buf[128];
     
     while (running_) {
+        // 检查是否有地址更新
+        pthread_mutex_lock(&mutex_);
+        bool addrUpdated = addressUpdated_;
+        addressUpdated_ = false;
+        std::string currentIp = ip_;
+        int currentPort = port_;
+        pthread_mutex_unlock(&mutex_);
+        
+        // 如果地址已更新且当前已连接，断开重连
+        if (addrUpdated && connected_) {
+            printf("🔄 地址已更新，断开当前连接...\n");
+            if (sockfd_ >= 0) {
+                close(sockfd_);
+                sockfd_ = -1;
+            }
+            connected_ = false;
+        }
+        
         // 如果未连接，尝试连接
         if (!connected_) {
-            printf("TCP尝试连接到 %s:%d...\n", ip_.c_str(), port_);
+            // 检查IP是否有效
+            if (currentIp.empty() || currentIp == "" || currentIp == "设备IP") {
+                printf("⚠️  等待上位机发现（当前IP无效）...\n");
+                sleep(3);
+                continue;
+            }
+            
+            printf("TCP尝试连接到 %s:%d...\n", currentIp.c_str(), currentPort);
             if (init()) {
                 printf("✅ TCP连接成功！\n");
             } else {
