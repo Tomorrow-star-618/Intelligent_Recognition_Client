@@ -1,17 +1,35 @@
 /**
  * @file video.cc
- * @brief 视频处理模块实现
- * 
- * 四线程架构：
- * - 采集线程：30fps (VI硬件获取YUV)
- * - BGR转换线程：27fps (RGA加速YUV→BGR，系统瓶颈)
- * - 推理线程：6fps (RKNN NPU加速YOLO，每4帧推理1次)
- * - 编码推流线程：27fps (MPP VENC硬件编码H.264 + RTSP推流)
- * 
- * 性能优化：
- * - 三缓冲区零拷贝设计（指针交换代替内存拷贝）
- * - 智能跳帧推理（降低80%计算负载）
- * - 硬件加速（RGA/VENC/NPU）
+ * @brief 视频处理模块实现 —— 四线程异步硬件加速流水线
+ *
+ * 线程职责与性能指标：
+ * ┌───────────┬──────────────────────────────────────────┬──────────┐
+ * │ 线程       │ 工作内容                                  │ 目标帧率 │
+ * ├───────────┼──────────────────────────────────────────┼──────────┤
+ * │ Thread1   │ VI → memcpy(NV12→DMA)                    │ 30fps    │
+ * │ captureLoop│                                         │          │
+ * ├───────────┼──────────────────────────────────────────┼──────────┤
+ * │ Thread2   │ RGA NV12→RGB(<5ms) + 三缓冲轮换           │ ≈27fps   │
+ * │ bgrConvert│ [替代 CPU cvtColor ~32ms]                 │          │
+ * ├───────────┼──────────────────────────────────────────┼──────────┤
+ * │ Thread3   │ RGA letterbox(<3ms) + RKNN YOLOv5(~96ms) │ ≈6fps    │
+ * │ inference │ 每(INFERENCE_FRAME_SKIP+1)帧推理1次       │          │
+ * ├───────────┼──────────────────────────────────────────┼──────────┤
+ * │ Thread4   │ OpenCV绘制 + memcpy + VENC H.264 + RTSP  │ ≈27fps   │
+ * │ encodeLoop│                                          │          │
+ * └───────────┴──────────────────────────────────────────┴──────────┘
+ *
+ * RGA 使用约束（RV1106 RGA2）：
+ *  - 必须使用 DMA CMA 物理连续内存（/dev/rk_dma_heap/rk-dma-heap-cma）
+ *  - 必须使用 wrapbuffer_fd(fd, ...) 封装缓冲，不支持 wrapbuffer_virtualaddr
+ *  - 所有 YUV/RGB/letterbox 缓冲均在构造函数 / initRgaBuffers() 中预分配
+ *
+ * 图像格式约定（贯穿整个流水线）：
+ *  - captureLoop 输出：NV12（YCbCr 4:2:0 Semi-Planar）
+ *  - bgrConvertLoop 输出：RGB888（R-G-B 字节序，RK_FORMAT_RGB_888）
+ *  - VENC 输入格式：RK_FMT_RGB888 ✅（与 RGA 输出一致）
+ *  - RKNN 推理输入：RGB NHWC UINT8 ✅（与 RGA 输出一致）
+ *  - OpenCV Scalar：以 RGB 通道顺序解读（Scalar(R,G,B)）
  */
 #include "video.h"
 #include "control.h"
@@ -32,10 +50,26 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 
-// ==================== 构造/析构函数 ====================
+// ==================== 构造 / 析构 ====================
 
 /**
- * @brief 构造函数 - 初始化参数和缓冲区
+ * @brief 构造函数：初始化所有成员并预分配 DMA 缓冲区
+ *
+ * DMA 分配说明：
+ *  所有 RGA 操作的内存必须是物理连续的 DMA CMA 内存。
+ *  优先使用 RV1106_CMA_HEAP_PATH（/dev/rk_dma_heap/rk-dma-heap-cma），
+ *  失败时回退到 DMA_HEAP_PATH（/dev/dma_heap/system）。
+ *
+ *  分配的缓冲区：
+ *   1. capture_buffer_.dma  ← NV12，width×height×3/2 字节
+ *      captureLoop 通过 va 写入（memcpy），bgrConvertLoop 通过 fd 交给 RGA 读取
+ *   2. bgr_buffer_.dma_write/ready/read ← RGB888，width×height×3 字节 ×3
+ *      bgrConvertLoop 通过 fd 交给 RGA 写入，encodeLoop/inferenceLoop 通过 va 读取
+ *   3. letterbox_dma_ ← 在 initRgaBuffers() 中分配（init() 阶段）
+ *
+ *  cv::Mat 封装：
+ *   bgr_buffer_ 的三个 Mat 头 data 指针直接指向对应 DMA 的 va，
+ *   Mat 析构时不会 free data（data 生命周期由 dma_buf_free 管理）。
  */
 Video::Video(int width, int height, int model_width, int model_height)
     : width_(width), height_(height), 
@@ -53,6 +87,7 @@ Video::Video(int width, int height, int model_width, int model_height)
       thread_inference_(0), thread_encode_(0),
       inference_frame_skip_(INFERENCE_FRAME_SKIP),
       has_detection_result_(false),
+      letterbox_dma_(),
       onvif_server_(nullptr) {
     
     // 初始化上下文和时间戳
@@ -63,26 +98,45 @@ Video::Video(int width, int height, int model_width, int model_height)
 #ifdef ENABLE_FPS_DISPLAY
     memset(&program_start_time_, 0, sizeof(struct timeval));
 #endif
-    
-    // YUV缓冲区：采集→BGR转换
+
+    // ===== DMA 内存分配（RGA 硬件加速必须使用 DMA buf）=====
+    // 分配 YUV 缓冲区（采集→BGR转换，NV12格式）
     int yuv_size = width_ * height_ * 3 / 2;
-    capture_buffer_.yuv_data = (unsigned char*)malloc(yuv_size);
+    capture_buffer_.dma.size = yuv_size;
+    if (dma_buf_alloc(RV1106_CMA_HEAP_PATH, yuv_size,
+                      &capture_buffer_.dma.fd,
+                      &capture_buffer_.dma.va) < 0) {
+        // RV1106 CMA路径失败时回退到通用 system heap
+        dma_buf_alloc(DMA_HEAP_PATH, yuv_size,
+                      &capture_buffer_.dma.fd,
+                      &capture_buffer_.dma.va);
+    }
     capture_buffer_.ready = false;
     pthread_mutex_init(&capture_buffer_.mutex, NULL);
-    
-    // BGR三缓冲区：BGR转换→编码（零拷贝设计）
-    bgr_buffer_.bgr_write = new cv::Mat(height_, width_, CV_8UC3);
-    bgr_buffer_.bgr_ready = new cv::Mat(height_, width_, CV_8UC3);
-    bgr_buffer_.bgr_read = new cv::Mat(height_, width_, CV_8UC3);
+
+    // 分配 BGR 三缓冲区（BGR转换→编码，DMA内存，RGA直接写入）
+    int bgr_size = width_ * height_ * 3;
+    auto alloc_bgr_dma = [&](DmaBuf& dma) {
+        dma.size = bgr_size;
+        if (dma_buf_alloc(RV1106_CMA_HEAP_PATH, bgr_size, &dma.fd, &dma.va) < 0)
+            dma_buf_alloc(DMA_HEAP_PATH, bgr_size, &dma.fd, &dma.va);
+    };
+    alloc_bgr_dma(bgr_buffer_.dma_write);
+    alloc_bgr_dma(bgr_buffer_.dma_ready);
+    alloc_bgr_dma(bgr_buffer_.dma_read);
+    // 封装成 cv::Mat（data 指向 DMA va，CPU可直接读写）
+    bgr_buffer_.bgr_write = new cv::Mat(height_, width_, CV_8UC3, bgr_buffer_.dma_write.va);
+    bgr_buffer_.bgr_ready = new cv::Mat(height_, width_, CV_8UC3, bgr_buffer_.dma_ready.va);
+    bgr_buffer_.bgr_read  = new cv::Mat(height_, width_, CV_8UC3, bgr_buffer_.dma_read.va);
     bgr_buffer_.ready = false;
     bgr_buffer_.frame_index = 0;
     bgr_buffer_.timestamp = 0;
     pthread_mutex_init(&bgr_buffer_.mutex, NULL);
     
-    // 推理专用BGR三缓冲区：BGR转换→推理（零拷贝设计）
-    inference_bgr_buffer_.bgr_write = new cv::Mat(height_, width_, CV_8UC3);
-    inference_bgr_buffer_.bgr_ready = new cv::Mat(height_, width_, CV_8UC3);
-    inference_bgr_buffer_.bgr_read = new cv::Mat(height_, width_, CV_8UC3);
+    // 推理专用BGR三缓冲区：BGR转换→推理（浅拷贝 Mat 头，共享 bgr_buffer_ DMA数据）
+    inference_bgr_buffer_.bgr_write = new cv::Mat();
+    inference_bgr_buffer_.bgr_ready = new cv::Mat();
+    inference_bgr_buffer_.bgr_read  = new cv::Mat();
     inference_bgr_buffer_.ready = false; 
     inference_bgr_buffer_.frame_index = 0;
     pthread_mutex_init(&inference_bgr_buffer_.mutex, NULL);
@@ -92,7 +146,16 @@ Video::Video(int width, int height, int model_width, int model_height)
 }
 
 /**
- * @brief 析构函数 - 释放所有资源
+ * @brief 析构函数：stop() 后按顺序释放所有资源
+ *
+ * 释放顺序：
+ *  1. stop() / stopOnvif()：等待线程退出，释放硬件资源
+ *  2. pthread_mutex_destroy：销毁各缓冲区互斥锁
+ *  3. delete cv::Mat*：仅释放 Mat 头，不触碰 data（data 由 DMA 管理）
+ *  4. dma_buf_free：释放 YUV、RGB 三缓冲、letterbox 共 5 块 DMA 内存
+ *
+ * ⚠️ 注意：bgr_buffer_ 三缓冲 dma 的顺序（write/ready/read）在运行时会随
+ *          指针轮换而改变，析构时直接按当前字段名释放即可，无需关心顺序。
  */
 Video::~Video() {
     stop();
@@ -104,19 +167,25 @@ Video::~Video() {
     pthread_mutex_destroy(&detection_mutex_);
     pthread_mutex_destroy(&bgr_buffer_.mutex);
     
-    // 释放缓冲区
-    if (capture_buffer_.yuv_data) {
-        free(capture_buffer_.yuv_data);
-        capture_buffer_.yuv_data = NULL;
-    }
-    
-    // 释放BGR缓冲区
+    // 释放 BGR Mat 头（data 由 DMA 管理，不能 delete data）
     delete bgr_buffer_.bgr_write;
     delete bgr_buffer_.bgr_ready;
     delete bgr_buffer_.bgr_read;
     delete inference_bgr_buffer_.bgr_write;
     delete inference_bgr_buffer_.bgr_ready;
     delete inference_bgr_buffer_.bgr_read;
+
+    // 释放 DMA 缓冲区（YUV + BGR三缓冲 + letterbox）
+    if (capture_buffer_.dma.fd >= 0)
+        dma_buf_free(capture_buffer_.dma.size, &capture_buffer_.dma.fd, capture_buffer_.dma.va);
+    if (bgr_buffer_.dma_write.fd >= 0)
+        dma_buf_free(bgr_buffer_.dma_write.size, &bgr_buffer_.dma_write.fd, bgr_buffer_.dma_write.va);
+    if (bgr_buffer_.dma_ready.fd >= 0)
+        dma_buf_free(bgr_buffer_.dma_ready.size, &bgr_buffer_.dma_ready.fd, bgr_buffer_.dma_ready.va);
+    if (bgr_buffer_.dma_read.fd >= 0)
+        dma_buf_free(bgr_buffer_.dma_read.size, &bgr_buffer_.dma_read.fd, bgr_buffer_.dma_read.va);
+    if (letterbox_dma_.fd >= 0)
+        dma_buf_free(letterbox_dma_.size, &letterbox_dma_.fd, letterbox_dma_.va);
 }
 
 // ==================== 生命周期管理 ====================
@@ -203,6 +272,13 @@ bool Video::init() {
     venc_init(0, width_, height_, enCodecType);
     printf("[Video] ✅ VENC视频编码初始化成功\n");
     
+    // 9. RGA缓冲区注册（硬件加速YUV→BGR使用）
+    if (!initRgaBuffers()) {
+        printf("[Video] ❌ RGA缓冲区初始化失败\n");
+        return false;
+    }
+    printf("[Video] ✅ RGA缓冲区初始化成功\n");
+    
     return true;
 }
 
@@ -280,6 +356,9 @@ void Video::stop() {
     
     if(stFrame_.pstPack) free(stFrame_.pstPack);
     if(g_rtsplive_) rtsp_del_demo(g_rtsplive_);
+    
+    // 释放RGA缓冲句柄
+    releaseRgaBuffers();
     
     RK_MPI_SYS_Exit();
     release_yolov5_model(&rknn_app_ctx_);
@@ -399,10 +478,17 @@ void* Video::encodeThreadFunc(void* arg) {
     return nullptr;
 }
 
-// ============ 线程1: 采集循环 ============
-// 功能: 从VI硬件获取YUV帧，快速拷贝到capture_buffer
-// 性能: VI获取30ms + YUV拷贝2ms = 32ms → 稳定30fps
-// 特点: 不等待消费，直接覆盖旧数据，保证实时性（允许下游丢帧）
+// ============ Thread1：采集循环 ============
+// 职责：以 30fps 从 VI 硬件获取 NV12 YUV 帧，memcpy 到 capture_buffer_.dma.va
+//
+// 关键设计：
+//  - 不检查 ready 标志，直接覆盖写入，保证采集实时性
+//  - BGR 转换线程消费速度较慢时会丢帧，属于设计预期行为
+//
+// 耗时分解（典型值）：
+//  - RK_MPI_VI_GetChnFrame：~30ms（硬件同步等待，占主要时间）
+//  - memcpy(900KB NV12)：~2ms（CPU，无法省去，因 VI 输出不是 CMA 内存）
+//  - 合计：~32ms → 30fps
 void Video::captureLoop() {
     RK_S32 s32Ret;
     int frame_counter = 0;
@@ -437,7 +523,7 @@ void Video::captureLoop() {
         // 🔒 快速拷贝YUV到BGR转换缓冲区（每帧都要，~2ms，加锁保护）
         // 注意：不检查ready标志，直接覆盖，BGR转换线程会丢帧（保证采集30fps实时性）
         pthread_mutex_lock(&capture_buffer_.mutex);
-        memcpy(capture_buffer_.yuv_data, vi_data, yuv_size);
+        memcpy(capture_buffer_.dma.va, vi_data, yuv_size);
         capture_buffer_.timestamp = timestamp;
         capture_buffer_.ready = true;
         pthread_mutex_unlock(&capture_buffer_.mutex);
@@ -461,14 +547,27 @@ void Video::captureLoop() {
     printf("[采集线程] 退出\n");
 }
 
-// ============ 线程2: BGR转换循环 ============
-// 功能: 从capture_buffer获取YUV，转换为BGR，同时输出给编码和推理线程
-// 性能: YUV→BGR 32ms（RV1106无GPU硬件限制，瓶颈） + 指针轮换<1us + 推理拷贝10ms
-// 特点: 转换在write缓冲区完成（无锁），轮换时仅交换指针（极快），每N帧拷贝给推理
+// ============ Thread2：RGB 转换循环 ============
+// 职责：将 NV12 YUV 帧转换为 RGB888，输出到 bgr_buffer_ 三缓冲，
+//        并按跳帧规则向 inference_bgr_buffer_ 传递推理帧
+//
+// RGA 加速路径（主路径）：
+//  wrapbuffer_fd(capture_buffer_.dma.fd, NV12) →
+//  imcvtcolor(BT.601 Full Range) →
+//  wrapbuffer_fd(bgr_buffer_.dma_write.fd, RGB888)
+//  耗时：<5ms（RGA 硬件，替代 CPU cvtColor 的 ~32ms）
+//
+// CPU 回退路径（RGA 失败时）：
+//  cv::cvtColor(capture_buffer_.dma.va, COLOR_YUV420sp2RGB)
+//  保证不丢帧，但会增加 CPU 负载
+//
+// 三缓冲轮换规则（⚠️ DmaBuf 与 cv::Mat* 必须同步交换）：
+//  bgrConvertLoop 写完 dma_write → 加锁 → swap(dma_write ↔ dma_ready, bgr_write ↔ bgr_ready)
+//  encodeLoop 消费时 → 加锁 → swap(dma_ready ↔ dma_read, bgr_ready ↔ bgr_read)
+//  违反同步规则会导致 RGA fd 与 Mat data 指向不同物理内存，引发频闪
 void Video::bgrConvertLoop() {
-    int yuv_size = width_ * height_ * 3 / 2;
-    unsigned char* yuv_buffer = (unsigned char*)malloc(yuv_size);
-    cv::Mat yuv_mat;
+    // RGA版本：直接从capture_buffer_.yuv_data（已注册RGA句柄）转换到bgr_write
+    // 无需再分配yuv_buffer局部缓冲，消除一次900KB的CPU memcpy
     int frame_counter = 0;
     
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -476,15 +575,14 @@ void Video::bgrConvertLoop() {
     long cvt_time_us, swap_time_us, inference_copy_time_us = 0;
 #endif
     
-    printf("[BGR转换线程] 启动 - 三缓冲指针轮换模式 + 推理BGR共享\n");
+    printf("[BGR转换线程] 启动 - RGA硬件加速模式（NV12→BGR，<5ms）\n");
     
     while(running_) {
         bool has_frame = false;
         
-        // 🔒 从capture_buffer获取YUV数据（加锁保护）
+        // 🔒 检查YUV数据就绪（加锁保护，仅检查ready标志，无需拷贝）
         pthread_mutex_lock(&capture_buffer_.mutex);
         if (capture_buffer_.ready) {
-            memcpy(yuv_buffer, capture_buffer_.yuv_data, yuv_size);
             has_frame = true;
             capture_buffer_.ready = false;  // 标记已消费
         }
@@ -499,9 +597,31 @@ void Video::bgrConvertLoop() {
         gettimeofday(&t_start, NULL);
 #endif
         
-        // YUV→BGR转换（无锁，直接写入write缓冲区，32ms为系统瓶颈）
-        yuv_mat = cv::Mat(height_ + height_ / 2, width_, CV_8UC1, yuv_buffer);
-        cv::cvtColor(yuv_mat, *bgr_buffer_.bgr_write, cv::COLOR_YUV420sp2BGR);
+        // ============ RGA硬件加速 YUV(NV12) → RGB ============
+        // 源：capture_buffer_.dma.fd（DMA buf，wrapbuffer_fd零拷贝封装）
+        // 目：bgr_buffer_.dma_write.fd（DMA buf，同上）
+        // 输出格式：RK_FORMAT_RGB_888（R-G-B字节序）
+        //   → VENC enPixelFormat = RK_FMT_RGB888 ✅
+        //   → 推理模型 RKNN NHWC UINT8 默认期望 RGB ✅
+        //   → OpenCV Mat CV_8UC3 存 R-G-B（后续 rectangle 颜色参数对应调整）
+        // RV1106 RGA2 只支持 DMA fd，不支持虚拟地址，必须用 wrapbuffer_fd
+        rga_buffer_t rga_src = wrapbuffer_fd(capture_buffer_.dma.fd,
+                                              width_, height_,
+                                              RK_FORMAT_YCbCr_420_SP);
+        rga_buffer_t rga_dst = wrapbuffer_fd(bgr_buffer_.dma_write.fd,
+                                              width_, height_,
+                                              RK_FORMAT_RGB_888);
+        IM_STATUS ret = imcvtcolor(rga_src, rga_dst,
+                                   RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888,
+                                   IM_YUV_TO_RGB_BT601_FULL);
+        if (ret != IM_STATUS_SUCCESS) {
+            // RGA失败时回退到CPU软件转换，保证不丢帧
+            printf("[BGR转换] ⚠️ RGA转换失败(%d)，回退CPU cvtColor\n", ret);
+            cv::Mat yuv_mat(height_ + height_ / 2, width_, CV_8UC1,
+                            capture_buffer_.dma.va);
+            // 输出 RGB 保持与 RGA 路径一致
+            cv::cvtColor(yuv_mat, *bgr_buffer_.bgr_write, cv::COLOR_YUV420sp2RGB);
+        }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
@@ -509,15 +629,18 @@ void Video::bgrConvertLoop() {
         gettimeofday(&t_start, NULL);
 #endif
         
-        // 🔒 三缓冲轮换：write→ready→read→write（加锁，仅轮换指针 <1us）
-        // 零拷贝技术：仅交换8字节指针，比拷贝2.7MB数据快数万倍
+        // 🔒 三缓冲轮换：write→ready（加锁，仅轮换Mat指针 <1us）
         pthread_mutex_lock(&bgr_buffer_.mutex);
-        cv::Mat* temp = bgr_buffer_.bgr_ready;  // 保存旧的ready
-        bgr_buffer_.bgr_ready = bgr_buffer_.bgr_write;  // write提升为ready
-        bgr_buffer_.bgr_write = temp;  // 旧ready降为write
-        bgr_buffer_.timestamp = TEST_COMM_GetNowUs();
-        bgr_buffer_.frame_index = frame_counter;
-        bgr_buffer_.ready = true;
+        // 轮换 DmaBuf（fd/va 跟随 Mat 指针一起换，保证 RGA fd 与 Mat data 一致）
+        DmaBuf   tmp_dma         = bgr_buffer_.dma_ready;
+        cv::Mat* tmp_mat         = bgr_buffer_.bgr_ready;
+        bgr_buffer_.dma_ready    = bgr_buffer_.dma_write;   // write晋升为ready
+        bgr_buffer_.bgr_ready    = bgr_buffer_.bgr_write;
+        bgr_buffer_.dma_write    = tmp_dma;                  // 旧ready降为write
+        bgr_buffer_.bgr_write    = tmp_mat;
+        bgr_buffer_.timestamp    = TEST_COMM_GetNowUs();
+        bgr_buffer_.frame_index  = frame_counter;
+        bgr_buffer_.ready        = true;
         pthread_mutex_unlock(&bgr_buffer_.mutex);
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -526,22 +649,26 @@ void Video::bgrConvertLoop() {
 #endif
         
         // 🔒 每N帧传递BGR数据给推理线程（三缓冲指针轮换，零拷贝优化）
-        // 优化：浅拷贝Mat头到write缓冲，然后指针轮换，避免18ms深拷贝
         if (ai_enable_ && (frame_counter % (inference_frame_skip_ + 1)) == 0) {
 #ifdef ENABLE_PERFORMANCE_TIMING
             gettimeofday(&t_start, NULL);
 #endif
-            // 浅拷贝：仅复制Mat头（48字节），共享数据指针（无锁，安全）
+            // 浅拷贝：仅复制Mat头（48字节），共享data指针（无锁，安全）
+            // 同步记录对应的 DMA fd（bgr_ready 此时对应 dma_ready）
             *inference_bgr_buffer_.bgr_write = *bgr_buffer_.bgr_ready;
+            inference_bgr_buffer_.dma_fd_write = bgr_buffer_.dma_ready.fd;
             
             // 三缓冲指针轮换（锁内<1us）
             pthread_mutex_lock(&inference_bgr_buffer_.mutex);
             if (!inference_bgr_buffer_.ready) {  // 避免覆盖未处理的帧
-                cv::Mat* temp = inference_bgr_buffer_.bgr_ready;
-                inference_bgr_buffer_.bgr_ready = inference_bgr_buffer_.bgr_write;
-                inference_bgr_buffer_.bgr_write = temp;
-                inference_bgr_buffer_.frame_index = frame_counter;
-                inference_bgr_buffer_.ready = true;
+                cv::Mat* tmp      = inference_bgr_buffer_.bgr_ready;
+                int      tmp_fd   = inference_bgr_buffer_.dma_fd_ready;
+                inference_bgr_buffer_.bgr_ready    = inference_bgr_buffer_.bgr_write;
+                inference_bgr_buffer_.dma_fd_ready = inference_bgr_buffer_.dma_fd_write;
+                inference_bgr_buffer_.bgr_write    = tmp;
+                inference_bgr_buffer_.dma_fd_write = tmp_fd;
+                inference_bgr_buffer_.frame_index  = frame_counter;
+                inference_bgr_buffer_.ready        = true;
             }
             pthread_mutex_unlock(&inference_bgr_buffer_.mutex);
             
@@ -556,7 +683,7 @@ void Video::bgrConvertLoop() {
 #ifdef ENABLE_PERFORMANCE_TIMING
         if (frame_counter % 30 == 0) {
             long total_us = cvt_time_us + swap_time_us + inference_copy_time_us;
-            printf("[BGR转换#%d] YUV→BGR: %ld us, 指针轮换: %ld us, 推理轮换: %ld us, 总计: %ld us\n", 
+            printf("[BGR转换#%d] RGA NV12→BGR: %ld us, 指针轮换: %ld us, 推理轮换: %ld us, 总计: %ld us\n", 
                    frame_counter, cvt_time_us, swap_time_us, inference_copy_time_us, total_us);
         }
 #endif
@@ -564,14 +691,29 @@ void Video::bgrConvertLoop() {
         frame_counter++;
     }
     
-    free(yuv_buffer);
     printf("[BGR转换线程] 退出\n");
 }
 
-// ============ 线程3: 推理循环 ============
-// 功能: 从inference_bgr_buffer获取BGR数据，letterbox缩放，RKNN推理
-// 性能: letterbox 18ms + 推理 96ms = 114ms（每5帧推理1次，三缓冲零拷贝优化）
-// 特点: 独立运行，不影响编码线程，结果通过detection_mutex_共享
+// ============ Thread3：推理循环 ============
+// 职责：对 RGB 帧做 letterbox 缩放后送入 RKNN YOLOv5，将结果写入 shared_detections_
+//
+// RGA letterbox 路径（主路径）：
+//  wrapbuffer_fd(bgr_dma_fd, RGB, 1280×720) →
+//  improcess(缩放到 scaledW×scaledH，写入 letterbox_dma_ 的 (leftPadding_,topPadding_) 偏移) →
+//  memcpy(letterbox_dma_.va → rknn_input_mems[0]->virt_addr)
+//
+//  letterbox 黑边只需在 initRgaBuffers() 时 memset(0) 一次，
+//  此后 RGA 每帧只写图像区域，黑边保持不变。
+//  耗时：<3ms（RGA 缩放，替代 CPU resize ~18ms）
+//
+// CPU 回退路径（RGA letterbox 失败时）：
+//  letterbox(bgr_mat)：CPU resize(INTER_NEAREST) + memset 黑边 + copyTo
+//
+// 结果处理：
+//  - ROI 过滤（area_enable_）：仅保留中心落在 video_rectInfo 内的框
+//  - 类别白名单过滤（obj_enable_）：仅保留 video_objList 内的类别
+//  - 通过 detection_mutex_ 将结果写入 shared_detections_（encodeLoop 读取）
+//  - 达到 send_interval_ 间隔时，通过 control_->onDetectionSummary() 上报
 void Video::inferenceLoop() {
     cv::Mat bgr_mat;
     int sX, sY, eX, eY;
@@ -596,14 +738,19 @@ void Video::inferenceLoop() {
         
         // 🔒 三缓冲指针交换获取待推理BGR帧（锁内<1us，零拷贝）
         bool has_frame = false;
+        int  bgr_dma_fd = -1;
         pthread_mutex_lock(&inference_bgr_buffer_.mutex);
         if (inference_bgr_buffer_.ready) {
-            cv::Mat* temp = inference_bgr_buffer_.bgr_read;
-            inference_bgr_buffer_.bgr_read = inference_bgr_buffer_.bgr_ready;
-            inference_bgr_buffer_.bgr_ready = temp;
+            cv::Mat* temp    = inference_bgr_buffer_.bgr_read;
+            int      tmp_fd  = inference_bgr_buffer_.dma_fd_read;
+            inference_bgr_buffer_.bgr_read    = inference_bgr_buffer_.bgr_ready;
+            inference_bgr_buffer_.dma_fd_read = inference_bgr_buffer_.dma_fd_ready;
+            inference_bgr_buffer_.bgr_ready    = temp;
+            inference_bgr_buffer_.dma_fd_ready = tmp_fd;
             inference_bgr_buffer_.ready = false;
             has_frame = true;
         }
+        bgr_dma_fd = inference_bgr_buffer_.dma_fd_read;
         pthread_mutex_unlock(&inference_bgr_buffer_.mutex);
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -623,10 +770,48 @@ void Video::inferenceLoop() {
         gettimeofday(&t_start, NULL);
 #endif
         
-        // letterbox + 推理
-        cv::Mat letterboxImage = letterbox(bgr_mat);
-        memcpy(rknn_app_ctx_.input_mems[0]->virt_addr, letterboxImage.data, 
-               model_width_ * model_height_ * 3);
+        // ============ RGA硬件加速 letterbox（缩放+填充） ============
+        // 计算letterbox缩放参数（与原letterbox函数等价）
+        float scaleX = (float)model_width_  / (float)width_;
+        float scaleY = (float)model_height_ / (float)height_;
+        scale_       = scaleX < scaleY ? scaleX : scaleY;
+        int scaledW  = (int)((float)width_  * scale_);
+        int scaledH  = (int)((float)height_ * scale_);
+        leftPadding_ = (model_width_  - scaledW) / 2;
+        topPadding_  = (model_height_ - scaledH) / 2;
+        
+        // RGA缩放：RGB(width_×height_) → RGB(scaledW×scaledH)，写入letterbox_dma_的padding偏移处
+        // letterbox_dma_.va已被memset(0)，黑边已就绪，无需每帧重刷
+        // RV1106 RGA2 只支持 DMA fd，必须用 wrapbuffer_fd
+        // 格式统一为 RK_FORMAT_RGB_888（与 imcvtcolor 输出一致，推理模型期望 RGB NHWC）
+        rga_buffer_t rga_lb_src = wrapbuffer_fd(bgr_dma_fd,
+                                                  width_, height_,
+                                                  RK_FORMAT_RGB_888);
+        // dst: stride设为model_width_，使RGA直接以完整行宽写入，自然形成padding
+        rga_buffer_t rga_lb_dst = wrapbuffer_fd(letterbox_dma_.fd,
+                                                  model_width_, model_height_,
+                                                  RK_FORMAT_RGB_888);
+        // im_rect指定dst写入起始偏移 (leftPadding_, topPadding_)
+        im_rect lb_src_rect  = {0, 0, width_, height_};
+        im_rect lb_dst_rect  = {leftPadding_, topPadding_, scaledW, scaledH};
+        rga_buffer_t rga_pat = {};
+        im_rect      rect_empty = {};
+        IM_STATUS lb_ret = improcess(rga_lb_src, rga_lb_dst, rga_pat,
+                                     lb_src_rect, lb_dst_rect, rect_empty,
+                                     IM_SYNC);
+        if (lb_ret != IM_STATUS_SUCCESS) {
+            // RGA失败时回退CPU letterbox（输出 RGB，与 RGA 路径一致）
+            printf("[推理] ⚠️ RGA letterbox失败(%d)，回退CPU\n", lb_ret);
+            // bgr_mat 实际存储的是 RGB（RGA imcvtcolor 输出 RK_FORMAT_RGB_888）
+            // CPU letterbox 直接 resize + 填充，格式不变
+            cv::Mat fallback = letterbox(bgr_mat);
+            memcpy(rknn_app_ctx_.input_mems[0]->virt_addr, fallback.data,
+                   model_width_ * model_height_ * 3);
+        } else {
+            // 直接从预分配letterbox_dma_拷贝到RKNN输入（640×640×3连续内存）
+            memcpy(rknn_app_ctx_.input_mems[0]->virt_addr, letterbox_dma_.va,
+                   model_width_ * model_height_ * 3);
+        }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
@@ -731,10 +916,30 @@ void Video::inferenceLoop() {
     printf("[推理线程] 退出\n");
 }
 
-// ============ 线程4: 编码推流循环 ============
-// 功能: 从BGR三缓冲区获取ready帧，绘制检测框+FPS，H.264编码，RTSP推流
-// 性能: 指针交换<1us + 绘制2ms + H.264编码12ms + RTSP 1ms = 15ms
-// 特点: 受限于BGR转换速度(37ms)，实际输出27fps，FPS在此线程统计
+// ============ Thread4：编码推流循环 ============
+// 职责：获取最新 RGB 帧，叠加检测框/FPS，H.264 编码后通过 RTSP 推流
+//
+// 帧获取：
+//  加锁 → swap(dma_ready↔dma_read, bgr_ready↔bgr_read) → 解锁
+//  DmaBuf 与 cv::Mat* 同步交换，保证 fd↔va 对应同一块物理内存
+//
+// 绘制（frame_ 为 RGB 字节序，Scalar 以 R-G-B 解读）：
+//  - 检测框：绿色 Scalar(0,255,0)，标签文字同色
+//  - ROI 区域框：蓝色 Scalar(0,0,255)
+//  - FPS 数值：绿色，右上角
+//  - 运行时长：白色 Scalar(255,255,255)，FPS 下方
+//
+// 编码路径：
+//  memcpy(frame_.data → VENC DMA MB data_) →
+//  RK_MPI_VENC_SendFrame → RK_MPI_VENC_GetStream →
+//  rtsp_tx_video → rtsp_do_event
+//
+// 耗时分解（典型值）：
+//  - 指针交换：<1us
+//  - OpenCV 绘制：~2ms
+//  - H.264 编码：~12ms（VENC 硬件）
+//  - RTSP 推流：~1ms
+//  - 合计：~15ms，受上游 bgrConvertLoop(~32ms) 限制实际约 27fps
 void Video::encodeLoop() {
     RK_S32 s32Ret;
     int last_processed_index = -1;  // 上次处理的帧序号（避免重复）
@@ -770,10 +975,13 @@ void Video::encodeLoop() {
         
         pthread_mutex_lock(&bgr_buffer_.mutex);
         if (bgr_buffer_.ready) {
-            // 交换ready和read指针（无论是否处理过，都交换以获取最新帧）
-            cv::Mat* temp = bgr_buffer_.bgr_read;
-            bgr_buffer_.bgr_read = bgr_buffer_.bgr_ready;
-            bgr_buffer_.bgr_ready = temp;
+            // 同时交换 DmaBuf 和 Mat 指针，保证两者始终对应同一块 DMA 内存
+            DmaBuf   tmp_dma      = bgr_buffer_.dma_read;
+            cv::Mat* tmp_mat      = bgr_buffer_.bgr_read;
+            bgr_buffer_.dma_read  = bgr_buffer_.dma_ready;
+            bgr_buffer_.bgr_read  = bgr_buffer_.bgr_ready;
+            bgr_buffer_.dma_ready = tmp_dma;
+            bgr_buffer_.bgr_ready = tmp_mat;
             
             timestamp = bgr_buffer_.timestamp;
             current_frame_index = bgr_buffer_.frame_index;
@@ -814,17 +1022,18 @@ void Video::encodeLoop() {
         pthread_mutex_unlock(&detection_mutex_);
         
         // 绘制检测框（使用缓存结果，每帧都绘制）
+        // ⚠️ frame_ 存储 RGB 字节序（RGA 输出 RK_FORMAT_RGB_888），Scalar(R,G,B)
         if (ai_enable_ && has_detection_result_ && !cached_detections_.empty()) {
             for (const auto& det : cached_detections_) {
                 cv::rectangle(frame_, 
                             cv::Point(det.x, det.y), 
                             cv::Point(det.x + det.w, det.y + det.h), 
-                            cv::Scalar(0,255,0), 2); // 线宽从3改为2
+                            cv::Scalar(0, 255, 0), 2);  // 绿色 (R=0,G=255,B=0)
                 
                 char text[64];
-                sprintf(text, "%s %.0f%%", det.cls_name.c_str(), det.confidence * 100); // 去掉小数
+                sprintf(text, "%s %.0f%%", det.cls_name.c_str(), det.confidence * 100);
                 cv::putText(frame_, text, cv::Point(det.x, det.y - 8), 
-                           cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,0), 1); // 字体和线宽减小
+                           cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 1);
             }
         }
         
@@ -835,12 +1044,13 @@ void Video::encodeLoop() {
             int area_w = (int)(video_rectInfo.w * width_);
             int area_h = (int)(video_rectInfo.h * height_);
             
+            // RGB Mat 中 Scalar(0,0,255) = 蓝色
             cv::rectangle(frame_, cv::Point(area_x, area_y), 
                         cv::Point(area_x + area_w, area_y + area_h), 
-                        cv::Scalar(255, 0, 0), 1); // 线宽从2改为1
+                        cv::Scalar(0, 0, 255), 1);
             
-            cv::putText(frame_, "Area", cv::Point(area_x, area_y - 8), // 简化文字
-                       cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
+            cv::putText(frame_, "Area", cv::Point(area_x, area_y - 8),
+                       cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
         }
         
 #if defined(ENABLE_FPS_CONSOLE) || defined(ENABLE_FPS_DISPLAY)
@@ -875,16 +1085,17 @@ void Video::encodeLoop() {
         if (current_fps_ > 0.0f) {
             char fps_text[32];
             sprintf(fps_text, "%.1f", current_fps_);  // 显示1位小数
+            // RGB Mat：Scalar(0,255,0) = 绿色
             cv::putText(frame_, fps_text, 
                        cv::Point(width_ - 60, height_ / 4), 
                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
             
-            // 在FPS下方显示运行时间
+            // 在FPS下方显示运行时间（白色）
             char time_text[32];
             sprintf(time_text, "%02d:%02d.%03d", minutes, seconds, milliseconds);
             cv::putText(frame_, time_text, 
                        cv::Point(width_ - 90, height_ / 4 + 25), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 255), 1);
+                       cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255), 1);
         }
 #endif
 #endif
@@ -935,8 +1146,20 @@ void Video::encodeLoop() {
     printf("[编码线程] 退出\n");
 }
 
-// letterbox处理：缩放+填充，适配模型输入
-// 优化：使用INTER_NEAREST插值（比INTER_LINEAR快2-5倍）+ memset填充黑边
+/**
+ * @brief CPU 版 letterbox 缩放（RGA 路径失败时的回退实现）
+ * @param input 输入图像（RGB 或 BGR，1280×720，CV_8UC3）
+ * @return 640×640 letterbox 图像（通道顺序与输入相同，黑边填 0）
+ *
+ * 实现步骤：
+ *  1. 计算等比缩放系数 scale_ = min(W_scale, H_scale)
+ *  2. INTER_NEAREST resize（比 INTER_LINEAR 快 2~5 倍，精度损失可接受）
+ *  3. memset 黑色背景（640×640×3）
+ *  4. copyTo 到 (leftPadding_, topPadding_) 偏移处
+ *
+ * 同步副作用：更新 scale_、leftPadding_、topPadding_ 成员变量，
+ * 与 RGA 路径保持相同的坐标映射参数。
+ */
 cv::Mat Video::letterbox(cv::Mat input) {
     float scaleX = (float)model_width_ / (float)width_;
     float scaleY = (float)model_height_ / (float)height_;
@@ -954,7 +1177,68 @@ cv::Mat Video::letterbox(cv::Mat input) {
     return letterboxImage;
 }
 
-// 坐标映射回原图
+// ==================== RGA 资源管理 ====================
+
+/**
+ * @brief 分配 letterbox 专用 DMA 缓冲并预填黑色
+ * @return true=成功，false=CMA 和 system heap 均分配失败
+ *
+ * 分配策略：
+ *  优先 RV1106_CMA_HEAP_PATH(/dev/rk_dma_heap/rk-dma-heap-cma)，
+ *  失败时回退 DMA_HEAP_PATH(/dev/dma_heap/system)。
+ *
+ * 预填黑色（memset 0）的意义：
+ *  letterbox 的黑边区域只需初始化一次。
+ *  后续 RGA improcess 每帧只写入图像区域（lb_dst_rect 指定偏移），
+ *  黑边区域保持不变，无需每帧重新 memset，节省 ~0.5ms/帧。
+ *
+ * 在 init() 的最后一步调用，确保 model_width_/model_height_ 已设置。
+ */
+bool Video::initRgaBuffers() {
+    int lb_size = model_width_ * model_height_ * 3;  // 640×640×3 = 1.2MB
+
+    // 分配 letterbox 专用 DMA buf（CMA 物理连续，RGA 可直接写入）
+    if (dma_buf_alloc(RV1106_CMA_HEAP_PATH, lb_size,
+                      &letterbox_dma_.fd, &letterbox_dma_.va) < 0) {
+        // 回退到通用 system heap
+        if (dma_buf_alloc(DMA_HEAP_PATH, lb_size,
+                          &letterbox_dma_.fd, &letterbox_dma_.va) < 0) {
+            printf("[RGA] ❌ letterbox DMA缓冲分配失败\n");
+            return false;
+        }
+    }
+    letterbox_dma_.size = lb_size;
+    memset(letterbox_dma_.va, 0, lb_size);  // 预填黑色（letterbox黑边只填一次）
+
+    printf("[RGA] ✅ letterbox DMA缓冲初始化成功 (%d KB, fd=%d)\n",
+           lb_size / 1024, letterbox_dma_.fd);
+    return true;
+}
+
+/**
+ * @brief 释放 letterbox DMA 缓冲（在 stop() 内调用）
+ *
+ * dma_buf_free 解除 mmap 并关闭 fd，
+ * 随后将 letterbox_dma_ 重置为默认值（fd=-1）防止二次释放。
+ * YUV 和 BGR 三缓冲的释放在析构函数中直接进行。
+ */
+void Video::releaseRgaBuffers() {
+    if (letterbox_dma_.fd >= 0) {
+        dma_buf_free(letterbox_dma_.size, &letterbox_dma_.fd, letterbox_dma_.va);
+        letterbox_dma_ = DmaBuf{};  // 重置为默认值（fd=-1, va=nullptr, size=0）
+    }
+    printf("[RGA] ✅ RGA缓冲已释放\n");
+}
+
+/**
+ * @brief 将模型输出坐标映射回原始图像坐标
+ * @param x 输入模型坐标 x → 输出原图坐标 x
+ * @param y 输入模型坐标 y → 输出原图坐标 y
+ *
+ * letterbox 正变换：原图 → 等比缩放 → 居中偏移(leftPadding_, topPadding_)
+ * 逆变换：模型坐标 - padding → 除以 scale_
+ * 依赖 inferenceLoop 在每帧推理前更新的 scale_ / leftPadding_ / topPadding_。
+ */
 void Video::mapCoordinates(int *x, int *y) {
     int mx = *x - leftPadding_;
     int my = *y - topPadding_;
@@ -1012,7 +1296,11 @@ void Video::setSendInterval(int interval) {
     }
 }
 
-// 构建检测结果汇总字符串
+/**
+ * @brief 将 current_detections_ 序列化为固定格式字符串，通过 TCP 上报
+ * @return 格式："DETECTIONS:N|cls_id:name:x:y:w:h:conf|..."
+ *         无检测时返回："DETECTIONS:NONE"
+ */
 std::string Video::buildDetectionSummary() {
     if (current_detections_.empty()) {
         return "DETECTIONS:NONE";

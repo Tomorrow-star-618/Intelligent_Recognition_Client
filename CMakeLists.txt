@@ -44,6 +44,8 @@ file(GLOB SRC_YOLO "${EXAMPLE_DIR}/modules/yolo/*.cc")
 file(GLOB SRC_ONVIF "${EXAMPLE_DIR}/modules/onvif/*.cc")  # ONVIF模块
 file(GLOB SRC_UDP_DISCOVERY "${EXAMPLE_DIR}/modules/udp_discovery/*.cc")  # UDP发现模块
 file(GLOB SRC_MAIN "${EXAMPLE_DIR}/src/*.cc")
+# DMA缓冲区分配器（RGA硬件加速所需，提供dma_buf_alloc/dma_buf_free）
+set(SRC_DMA_ALLOC "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/allocator/dma/dma_alloc.cpp")
 
 set(SRC_FILES
     ${SRC_CONTROL}
@@ -53,6 +55,7 @@ set(SRC_FILES
     ${SRC_YOLO}
     ${SRC_ONVIF}  # 添加ONVIF源文件
     ${SRC_UDP_DISCOVERY}  # 添加UDP发现模块
+    ${SRC_DMA_ALLOC}      # DMA缓冲区分配器
     ${SRC_MAIN}
 )
 add_executable(${PROJECT_NAME} ${SRC_FILES})
@@ -101,6 +104,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
                             ${CMAKE_CURRENT_SOURCE_DIR}/include/rknn
                             ${CMAKE_CURRENT_SOURCE_DIR}/include/librga 
                             ${CMAKE_CURRENT_SOURCE_DIR}/include/rkaiq
+                            ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/allocator/dma
                             ${CMAKE_CURRENT_SOURCE_DIR}/include/rkaiq/uAPI2
                             ${CMAKE_CURRENT_SOURCE_DIR}/include/rkaiq/common
                             ${CMAKE_CURRENT_SOURCE_DIR}/include/rkaiq/xcore
