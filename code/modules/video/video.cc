@@ -33,7 +33,6 @@
  */
 #include "video.h"
 #include "control.h"
-#include "../onvif/onvif_server.h"
 
 // 系统库
 #include <stdio.h>
@@ -87,8 +86,7 @@ Video::Video(int width, int height, int model_width, int model_height)
       thread_inference_(0), thread_encode_(0),
       inference_frame_skip_(INFERENCE_FRAME_SKIP),
       has_detection_result_(false),
-      letterbox_dma_(),
-      onvif_server_(nullptr) {
+      letterbox_dma_() {
     
     // 初始化上下文和时间戳
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
@@ -149,7 +147,7 @@ Video::Video(int width, int height, int model_width, int model_height)
  * @brief 析构函数：stop() 后按顺序释放所有资源
  *
  * 释放顺序：
- *  1. stop() / stopOnvif()：等待线程退出，释放硬件资源
+ *  1. stop()：等待线程退出，释放硬件资源
  *  2. pthread_mutex_destroy：销毁各缓冲区互斥锁
  *  3. delete cv::Mat*：仅释放 Mat 头，不触碰 data（data 由 DMA 管理）
  *  4. dma_buf_free：释放 YUV、RGB 三缓冲、letterbox 共 5 块 DMA 内存
@@ -159,7 +157,6 @@ Video::Video(int width, int height, int model_width, int model_height)
  */
 Video::~Video() {
     stop();
-    stopOnvif();
     
     // 销毁互斥锁
     pthread_mutex_destroy(&capture_buffer_.mutex);
@@ -1320,81 +1317,4 @@ std::string Video::buildDetectionSummary() {
     return oss.str();
 }
 
-// ============ ONVIF协议支持 ============
-
-// 启动ONVIF服务
-bool Video::startOnvif(int port) {
-    if (onvif_server_) {
-        printf("[Video] ONVIF服务已在运行\n");
-        return false;
-    }
-    
-    // 创建ONVIF服务器对象
-    onvif_server_ = new OnvifServer(this, port);
-    
-    // 设置设备信息
-    onvif_server_->setDeviceInfo(
-        "SmartCamera",           // 制造商
-        "RV1106-AI-Camera",      // 型号
-        "1.0.0",                 // 固件版本
-        "RV1106-20241216001"     // 序列号
-    );
-    
-    // 设置RTSP流地址
-    onvif_server_->setRtspUrl(getRtspUrl());
-    
-    // 启动ONVIF服务
-    if (!onvif_server_->start()) {
-        delete onvif_server_;
-        onvif_server_ = nullptr;
-        printf("[Video] ❌ ONVIF服务启动失败\n");
-        return false;
-    }
-    
-    printf("[Video] ✅ ONVIF服务启动成功，端口: %d\n", port);
-    return true;
-}
-
-// 停止ONVIF服务
-void Video::stopOnvif() {
-    if (onvif_server_) {
-        onvif_server_->stop();
-        delete onvif_server_;
-        onvif_server_ = nullptr;
-        printf("[Video] ONVIF服务已停止\n");
-    }
-}
-
-// 获取RTSP流地址
-std::string Video::getRtspUrl() const {
-    // 动态获取本机IP地址
-    std::string local_ip = "192.168.1.100";  // 默认IP
-    
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock >= 0) {
-        struct ifreq ifr;
-        memset(&ifr, 0, sizeof(ifr));
-        
-        // 尝试eth0网卡
-        strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
-        if (ioctl(sock, SIOCGIFADDR, &ifr) >= 0) {
-            struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
-            local_ip = std::string(inet_ntoa(addr->sin_addr));
-        } else {
-            // 尝试wlan0网卡
-            strncpy(ifr.ifr_name, "wlan0", IFNAMSIZ - 1);
-            if (ioctl(sock, SIOCGIFADDR, &ifr) >= 0) {
-                struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
-                local_ip = std::string(inet_ntoa(addr->sin_addr));
-            }
-        }
-        close(sock);
-    }
-    
-    // 构建RTSP地址：rtsp://IP:554/live/0
-    char rtsp_url[256];
-    snprintf(rtsp_url, sizeof(rtsp_url), "rtsp://%s:554/live/0", local_ip.c_str());
-    
-    return std::string(rtsp_url);
-}
 

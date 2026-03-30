@@ -82,16 +82,6 @@ int main(int argc, char *argv[])
         printf("视频模块初始化成功！\n");
         g_video->start();
         printf("视频线程已自动启动\n");
-        
-        // ✅ 启动ONVIF服务（端口8080）
-        printf("开始启动ONVIF服务...\n");
-        if (g_video->startOnvif(8080)) {
-            printf("✅ ONVIF服务启动成功！\n");
-            printf("   - 设备发现地址: http://设备IP:8080/onvif/device_service\n");
-            printf("   - 客户端可通过ONVIF协议发现并获取RTSP流地址\n");
-        } else {
-            printf("❌ ONVIF服务启动失败（不影响RTSP推流）\n");
-        }
     } else {
         printf("视频模块初始化失败！\n");
     }
@@ -162,6 +152,11 @@ int main(int argc, char *argv[])
     printf("  RECT:100,100,200,150      - 设置检测区域\n");
     printf("  LIST:0,1,2                - 设置检测对象\n");
     printf("  quit                      - 退出程序\n");
+    printf("===========================================\n");
+    printf("服务状态：\n");
+    printf("  ✅ RTSP 推流      - rtsp://%s/live/0\n", localIp.c_str());
+    printf("  ✅ UDP 发现服务   - 端口 8888\n");
+    printf("  ✅ TCP 通信       - 等待上位机连接\n");
     printf("===========================================\n");
     
     while (!quit)

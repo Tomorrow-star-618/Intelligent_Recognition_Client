@@ -40,8 +40,8 @@
 #define ENABLE_FPS_DISPLAY          // 开启画面右上角 FPS + 运行时间叠加显示
 
 // ==================== 系统配置参数 ====================
-#define IMAGE_WIDTH           1280  // 采集/编码分辨率：宽（像素）
-#define IMAGE_HEIGHT          720   // 采集/编码分辨率：高（像素）
+#define IMAGE_WIDTH           1920   // 采集/编码分辨率：宽（像素）
+#define IMAGE_HEIGHT          1080   // 采集/编码分辨率：高（像素）
 #define MODEL_WIDTH           640   // YOLOv5 模型输入宽度
 #define MODEL_HEIGHT          640   // YOLOv5 模型输入高度
 #define INFERENCE_FRAME_SKIP  3     // 推理跳帧数：每 (N+1) 帧推理 1 次，3 → 每4帧推1次
@@ -69,7 +69,6 @@
 
 // ==================== 前向声明 ====================
 class Control;
-class OnvifServer;
 
 /**
  * @class Video
@@ -166,11 +165,6 @@ public:
     // ==================== 模块关联 ====================
     /** 注入 Control 模块指针，用于检测结果回调 onDetectionSummary() */
     void setControl(Control* control);
-
-    // ==================== ONVIF 协议 ====================
-    bool startOnvif(int port = 8080); // 启动 ONVIF 服务（设备发现/PTZ/流地址）
-    void stopOnvif();                 // 停止 ONVIF 服务
-    std::string getRtspUrl() const;   // 获取本机 RTSP 地址（自动探测 eth0/wlan0 IP）
 
 private:
     // ==================== 内部数据结构 ====================
@@ -431,9 +425,6 @@ private:
 #ifdef ENABLE_FPS_DISPLAY
     struct timeval program_start_time_; // 程序启动时刻（计算累计运行时长）
 #endif
-
-    // --- ONVIF 服务 ---
-    OnvifServer* onvif_server_; // ONVIF 服务器实例（nullptr = 未启动）
 };
 
 #endif // VIDEO_H
