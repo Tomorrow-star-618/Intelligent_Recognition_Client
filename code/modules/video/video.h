@@ -208,6 +208,7 @@ private:
         uint64_t        timestamp; // 帧时间戳（微秒，来自 TEST_COMM_GetNowUs）
         bool            ready;     // true = 有新帧待处理
         pthread_mutex_t mutex;     // 保护 ready 标志的读写
+        pthread_cond_t  cond;      // 条件变量：采集线程生产后唤醒 BGR 转换线程
     };
 
     /**
@@ -235,6 +236,7 @@ private:
         int      frame_index;  // 最新 ready 帧的帧序号（用于推理跳帧判断）
         bool     ready;        // true = dma_ready 有新帧待编码
         pthread_mutex_t mutex; // 保护 dma/Mat 指针轮换和 ready 标志
+        pthread_cond_t  cond;  // 条件变量：BGR 转换线程生产后唤醒编码线程
     };
 
     /**

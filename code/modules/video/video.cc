@@ -111,6 +111,7 @@ Video::Video(int width, int height, int model_width, int model_height)
     }
     capture_buffer_.ready = false;
     pthread_mutex_init(&capture_buffer_.mutex, NULL);
+    pthread_cond_init(&capture_buffer_.cond, NULL);
 
     // 分配 BGR 三缓冲区（BGR转换→编码，DMA内存，RGA直接写入）
     int bgr_size = width_ * height_ * 3;
@@ -130,6 +131,7 @@ Video::Video(int width, int height, int model_width, int model_height)
     bgr_buffer_.frame_index = 0;
     bgr_buffer_.timestamp = 0;
     pthread_mutex_init(&bgr_buffer_.mutex, NULL);
+    pthread_cond_init(&bgr_buffer_.cond, NULL);
     
     // 推理专用BGR三缓冲区：BGR转换→推理（浅拷贝 Mat 头，共享 bgr_buffer_ DMA数据）
     inference_bgr_buffer_.bgr_write = new cv::Mat();
@@ -160,9 +162,11 @@ Video::~Video() {
     
     // 销毁互斥锁
     pthread_mutex_destroy(&capture_buffer_.mutex);
+    pthread_cond_destroy(&capture_buffer_.cond);
     pthread_mutex_destroy(&inference_bgr_buffer_.mutex);
     pthread_mutex_destroy(&detection_mutex_);
     pthread_mutex_destroy(&bgr_buffer_.mutex);
+    pthread_cond_destroy(&bgr_buffer_.cond);
     
     // 释放 BGR Mat 头（data 由 DMA 管理，不能 delete data）
     delete bgr_buffer_.bgr_write;
@@ -319,6 +323,15 @@ bool Video::start() {
  */
 void Video::stop() {
     running_ = false;
+
+    // 唤醒可能阻塞在条件变量上的线程，确保可及时退出
+    pthread_mutex_lock(&capture_buffer_.mutex);
+    pthread_cond_broadcast(&capture_buffer_.cond);
+    pthread_mutex_unlock(&capture_buffer_.mutex);
+
+    pthread_mutex_lock(&bgr_buffer_.mutex);
+    pthread_cond_broadcast(&bgr_buffer_.cond);
+    pthread_mutex_unlock(&bgr_buffer_.mutex);
     
     // 等待所有线程退出
     if (thread_capture_) {
@@ -380,6 +393,15 @@ void Video::pauseAllThreads() {
     
     printf("[Video] ⏸️  暂停所有线程...\n");
     running_ = false;
+
+    // 唤醒可能阻塞在条件变量上的线程，确保可及时退出
+    pthread_mutex_lock(&capture_buffer_.mutex);
+    pthread_cond_broadcast(&capture_buffer_.cond);
+    pthread_mutex_unlock(&capture_buffer_.mutex);
+
+    pthread_mutex_lock(&bgr_buffer_.mutex);
+    pthread_cond_broadcast(&bgr_buffer_.cond);
+    pthread_mutex_unlock(&bgr_buffer_.mutex);
     
     // 等待所有线程退出
     if (thread_capture_) {
@@ -523,6 +545,7 @@ void Video::captureLoop() {
         memcpy(capture_buffer_.dma.va, vi_data, yuv_size);
         capture_buffer_.timestamp = timestamp;
         capture_buffer_.ready = true;
+    pthread_cond_signal(&capture_buffer_.cond);  // 通知BGR转换线程有新帧
         pthread_mutex_unlock(&capture_buffer_.mutex);
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -575,20 +598,17 @@ void Video::bgrConvertLoop() {
     printf("[BGR转换线程] 启动 - RGA硬件加速模式（NV12→BGR，<5ms）\n");
     
     while(running_) {
-        bool has_frame = false;
-        
-        // 🔒 检查YUV数据就绪（加锁保护，仅检查ready标志，无需拷贝）
+        // 🔒 等待YUV数据就绪（条件变量阻塞等待，避免轮询）
         pthread_mutex_lock(&capture_buffer_.mutex);
-        if (capture_buffer_.ready) {
-            has_frame = true;
-            capture_buffer_.ready = false;  // 标记已消费
+        while (running_ && !capture_buffer_.ready) {
+            pthread_cond_wait(&capture_buffer_.cond, &capture_buffer_.mutex);
         }
+        if (!running_) {
+            pthread_mutex_unlock(&capture_buffer_.mutex);
+            break;
+        }
+        capture_buffer_.ready = false;  // 标记已消费
         pthread_mutex_unlock(&capture_buffer_.mutex);
-        
-        if (!has_frame) {
-            usleep(1000); // 1ms
-            continue;
-        }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_start, NULL);
@@ -638,6 +658,7 @@ void Video::bgrConvertLoop() {
         bgr_buffer_.timestamp    = TEST_COMM_GetNowUs();
         bgr_buffer_.frame_index  = frame_counter;
         bgr_buffer_.ready        = true;
+    pthread_cond_signal(&bgr_buffer_.cond);  // 通知编码线程有新帧
         pthread_mutex_unlock(&bgr_buffer_.mutex);
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -962,7 +983,6 @@ void Video::encodeLoop() {
     while(running_) {
         // 🔒 从BGR缓冲区交换ready→read指针（加锁保护，允许跳帧）
         // 三缓冲优势：编码线程使用read缓冲期间，BGR转换可同时写write缓冲
-        bool has_frame = false;
         uint64_t timestamp;
         int current_frame_index;
         
@@ -971,21 +991,26 @@ void Video::encodeLoop() {
 #endif
         
         pthread_mutex_lock(&bgr_buffer_.mutex);
-        if (bgr_buffer_.ready) {
-            // 同时交换 DmaBuf 和 Mat 指针，保证两者始终对应同一块 DMA 内存
-            DmaBuf   tmp_dma      = bgr_buffer_.dma_read;
-            cv::Mat* tmp_mat      = bgr_buffer_.bgr_read;
-            bgr_buffer_.dma_read  = bgr_buffer_.dma_ready;
-            bgr_buffer_.bgr_read  = bgr_buffer_.bgr_ready;
-            bgr_buffer_.dma_ready = tmp_dma;
-            bgr_buffer_.bgr_ready = tmp_mat;
-            
-            timestamp = bgr_buffer_.timestamp;
-            current_frame_index = bgr_buffer_.frame_index;
-            bgr_buffer_.ready = false;  // 标记已消费
-            has_frame = true;
-            last_processed_index = current_frame_index;  // 更新已处理帧序号
+        while (running_ && !bgr_buffer_.ready) {
+            pthread_cond_wait(&bgr_buffer_.cond, &bgr_buffer_.mutex);
         }
+        if (!running_) {
+            pthread_mutex_unlock(&bgr_buffer_.mutex);
+            break;
+        }
+
+        // 同时交换 DmaBuf 和 Mat 指针，保证两者始终对应同一块 DMA 内存
+        DmaBuf   tmp_dma      = bgr_buffer_.dma_read;
+        cv::Mat* tmp_mat      = bgr_buffer_.bgr_read;
+        bgr_buffer_.dma_read  = bgr_buffer_.dma_ready;
+        bgr_buffer_.bgr_read  = bgr_buffer_.bgr_ready;
+        bgr_buffer_.dma_ready = tmp_dma;
+        bgr_buffer_.bgr_ready = tmp_mat;
+
+        timestamp = bgr_buffer_.timestamp;
+        current_frame_index = bgr_buffer_.frame_index;
+        bgr_buffer_.ready = false;  // 标记已消费
+        last_processed_index = current_frame_index;  // 更新已处理帧序号
         pthread_mutex_unlock(&bgr_buffer_.mutex);
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -993,11 +1018,6 @@ void Video::encodeLoop() {
         swap_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
         gettimeofday(&t_start, NULL);
 #endif
-        
-        if (!has_frame) {
-            usleep(1000); // 1ms
-            continue;
-        }
         
         // 使用read缓冲区的BGR数据（浅拷贝，共享数据指针，无性能损失）
         frame_ = *bgr_buffer_.bgr_read;
